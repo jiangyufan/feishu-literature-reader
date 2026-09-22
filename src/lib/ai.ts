@@ -192,7 +192,10 @@ function buildPrompt(text: string, fields: TargetField[]): { system: string; use
     system: `你是一位学术文献阅读助手。下面是一份文献（论文、专著或整本书）经解析得到的全文文本，共 ${text.length} 个字符，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。`,
     user: `请从以下文献全文中提取以下字段的内容，严格输出 JSON（不要任何多余说明、不要 markdown 代码块以外的内容）。\n\n【字段列表】每个条目第一行是字段名（JSON 键名必须严格使用该字段名），第二行是该字段的提取要求：\n${fieldList}\n\n要求：\n- 所有字段值用简体中文填写（英文标题/作者/期刊名等专有名词保留原文）；\n- 若某字段在文中确实无法确定，值填 "未提及"；\n- 严禁全部字段都填 "未提及"，必须先从文本中认真提取；\n- JSON 键名只能是上面【字段列表】里的字段名，不能是描述文本；\n- 字段值中严禁出现任何 [xxx]、「……」、「...」等占位符或模板残留；
 - 如果某个字段在文献中确实只有概括性描述、没有具体实质内容，请直接填 "未提及"，不要 Echo 原始描述。
-- 空值只能填 "未提及" 这一个词，严禁自己编造"未提供文献全文""无作者信息""文中未找到"之类的说明性文字作为字段值。`,
+- 空值只能填 "未提及" 这一个词，严禁自己编造"未提供文献全文""无作者信息""文中未找到"之类的说明性文字作为字段值。
+
+【文献全文】
+${text}`,
   };
 }
 
@@ -220,7 +223,7 @@ async function callOnce(
   fields: TargetField[],
   cfg: AiConfig,
   signal?: AbortSignal
-): Promise<{ fields: Record<string, string>; usage: any }> {
+): Promise<{ fields: Record<string, string>; usage: any; raw: string }> {
   const { system, user } = buildPrompt(text, fields);
   const provider = PROVIDERS[cfg.provider];
   const headers: Record<string, string> = {
@@ -250,27 +253,31 @@ async function callOnce(
   const content = data?.choices?.[0]?.message?.content ?? '';
   const fieldsResult = parseFieldsJson(content);
   if (fieldsResult._error) throw new Error(fieldsResult._error);
-  return { fields: fieldsResult, usage: data?.usage };
+  return { fields: fieldsResult, usage: data?.usage, raw: content };
 }
 
+/** 提取模式：all=全部字段一次提取（快）；chunk=每批7个（均衡）；single=单字段逐个（最准、最慢） */
+export type ExtractMode = 'all' | 'chunk' | 'single';
+
 /**
- * 分批提取字段：把字段列表按每批 7 个拆分，逐批调用 AI 后合并结果。
- * 好处：模型面对 28 个字段 + 14 万字符容易偷懒全填"未提及"，
- * 拆小批次能逼它每批都认真提取；单批失败不影响其他批。
+ * 按模式分批提取字段，逐批调用 AI 后合并结果。
+ * 单批失败（重试 2 次后）跳过不影响其他批，全部失败才报错。
  */
 export async function extractFields(
   text: string,
   fields: TargetField[],
   cfg: AiConfig,
-  signal?: AbortSignal
-): Promise<{ fields: Record<string, string>; usage: any }> {
-  const CHUNK = 7;
+  signal?: AbortSignal,
+  mode: ExtractMode = 'chunk'
+): Promise<{ fields: Record<string, string>; usage: any; raws: string[] }> {
+  const CHUNK = mode === 'all' ? fields.length : mode === 'single' ? 1 : 7;
   const chunks: TargetField[][] = [];
   for (let i = 0; i < fields.length; i += CHUNK) {
     chunks.push(fields.slice(i, i + CHUNK));
   }
 
   const merged: Record<string, string> = {};
+  const raws: string[] = [];
   let usage: any;
   let lastError: Error | null = null;
   let okChunks = 0;
@@ -282,6 +289,7 @@ export async function extractFields(
         const r = await callOnce(text, chunk, cfg, signal);
         Object.assign(merged, r.fields);
         usage = r.usage;
+        raws.push(`【批次：${chunk.map((f) => f.name).join('、')}】\n${r.raw}`);
         okChunks += 1;
         lastError = null;
         break;
@@ -296,5 +304,5 @@ export async function extractFields(
   if (okChunks === 0) {
     throw lastError || new Error('AI 提取字段失败（所有批次均失败）');
   }
-  return { fields: merged, usage };
+  return { fields: merged, usage, raws };
 }

@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFields, PROVIDERS, ProviderId, TargetField, isEmptyValue, isTemplateResidue, isDescriptionEcho } from './lib/ai';
+import { extractFields, PROVIDERS, ProviderId, TargetField, ExtractMode, isEmptyValue, isTemplateResidue, isDescriptionEcho } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -55,6 +55,8 @@ export default function App() {
   const [textQuality, setTextQuality] = useState<TextQuality | null>(null);
   // 最近一次 AI 对每个字段的返回值详情（调试用）
   const [aiReturnPreview, setAiReturnPreview] = useState<string>('');
+  // 提取模式：all=全部一次 / chunk=每批7个 / single=单字段逐个
+  const [extractMode, setExtractMode] = useState<ExtractMode>('chunk');
   const [onlyEmpty, setOnlyEmpty] = useState(true);
   const [running, setRunning] = useState(false);
   const [recs, setRecs] = useState<RecState[]>([]);
@@ -241,10 +243,12 @@ export default function App() {
             status: 'generating',
             message: `AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符 / ${targetFields.length} 字段${truncated ? '，已截断' : ''}）`,
           });
-          const { fields } = await extractFields(text, targetFields, { provider, apiKey, model }, ac.signal);
+          const { fields, raws } = await extractFields(text, targetFields, { provider, apiKey, model }, ac.signal, extractMode);
 
-          // 诊断：把 AI 返回的每个字段实际值列出来（截断到 30 字），便于排查"为什么全被判空"
+          // 诊断：AI 原始返回 + 每个字段实际值（截断 30 字）
           setAiReturnPreview(
+            (raws.length ? `===== AI 原始返回 =====\n${raws.join('\n\n')}\n\n` : '') +
+            '===== 解析后的字段值 =====\n' +
             Object.entries(fields)
               .map(([k, v]) => {
                 const s = typeof v === 'string' ? v : String(v ?? '');
@@ -335,7 +339,7 @@ export default function App() {
     } finally {
       setRunning(false);
     }
-  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields]);
+  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode]);
 
   const doneCount = recs.filter((r) => r.status === 'done').length;
   const skipCount = recs.filter((r) => r.status === 'skipped').length;
@@ -434,6 +438,18 @@ export default function App() {
         {provider === 'kimi' && (
           <Banner type="warning" closeIcon={null} description="Kimi 官方 API 暂未开放浏览器直连（CORS 限制），当前仅作配置预留，正式接入需后端代理。" />
         )}
+        <Form.Slot label="提取模式">
+          <Select
+            value={extractMode}
+            onChange={(v) => setExtractMode(v as ExtractMode)}
+            style={{ width: '100%' }}
+            optionList={[
+              { label: '每批 7 个字段（推荐，均衡）', value: 'chunk' },
+              { label: '全部字段一次提取（快，易偷懒）', value: 'all' },
+              { label: '单字段逐个提取（最准，最慢、费额度）', value: 'single' },
+            ]}
+          />
+        </Form.Slot>
         <Checkbox checked={onlyEmpty} onChange={(e) => setOnlyEmpty((e.target as any).checked)}>
           仅填充空字段（已有内容的字段不覆盖）
         </Checkbox>

@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v5.7 分批提取（每批7字段）+ AI 返回值详情展示'
+msg = 'deploy: v5.8 【关键修复】文献全文注入 prompt + 提取模式选择 + AI 原始返回展示'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 
