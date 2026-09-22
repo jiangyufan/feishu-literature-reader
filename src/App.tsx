@@ -53,6 +53,8 @@ export default function App() {
   const [parsedChars, setParsedChars] = useState<number | null>(null);
   // 最近一次解析的文本质量诊断 + 样本（调试用）
   const [textQuality, setTextQuality] = useState<TextQuality | null>(null);
+  // 最近一次 AI 对每个字段的返回值详情（调试用）
+  const [aiReturnPreview, setAiReturnPreview] = useState<string>('');
   const [onlyEmpty, setOnlyEmpty] = useState(true);
   const [running, setRunning] = useState(false);
   const [recs, setRecs] = useState<RecState[]>([]);
@@ -241,6 +243,16 @@ export default function App() {
           });
           const { fields } = await extractFields(text, targetFields, { provider, apiKey, model }, ac.signal);
 
+          // 诊断：把 AI 返回的每个字段实际值列出来（截断到 30 字），便于排查"为什么全被判空"
+          setAiReturnPreview(
+            Object.entries(fields)
+              .map(([k, v]) => {
+                const s = typeof v === 'string' ? v : String(v ?? '');
+                return `${k} = ${s.slice(0, 30)}${s.length > 30 ? '…' : ''}`;
+              })
+              .join('\n')
+          );
+
           // 诊断：把 AI 返回的 key 列出来，便于排查字段名不匹配
           const returnedKeys = Object.keys(fields)
             .slice(0, 30)
@@ -363,6 +375,13 @@ export default function App() {
           <div style={{ fontSize: 12, color: '#666', background: '#f6f6f6', padding: 8, borderRadius: 6, wordBreak: 'break-all', maxHeight: 160, overflow: 'auto' }}>
             <div style={{ fontWeight: 600, marginBottom: 4 }}>解析文本开头 300 字样本（检查是否乱码）：</div>
             {textQuality.sample || '（空）'}
+          </div>
+        </Collapsible>
+      )}
+      {aiReturnPreview && (
+        <Collapsible title="AI 返回值详情（调试）" style={{ marginTop: 6 }}>
+          <div style={{ fontSize: 12, color: '#555', background: '#f6f6f6', padding: 8, borderRadius: 6, wordBreak: 'break-all', maxHeight: 220, overflow: 'auto', whiteSpace: 'pre-wrap' }}>
+            {aiReturnPreview}
           </div>
         </Collapsible>
       )}

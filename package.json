@@ -1,6 +1,6 @@
 {
   "name": "feishu-literature-reader",
-  "version": "5.6.0",
+  "version": "5.7.0",
   "type": "module",
   "description": "文献批量阅读插件：多维表格附件 PDF → 本地解析 → AI 提取字段",
   "scripts": {

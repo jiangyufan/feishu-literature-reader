@@ -214,8 +214,8 @@ export function parseFieldsJson(raw: string): Record<string, string> {
   }
 }
 
-/** 调用 chat/completions 提取字段（带重试） */
-export async function extractFields(
+/** 调用单次 chat/completions 提取一批字段 */
+async function callOnce(
   text: string,
   fields: TargetField[],
   cfg: AiConfig,
@@ -223,45 +223,78 @@ export async function extractFields(
 ): Promise<{ fields: Record<string, string>; usage: any }> {
   const { system, user } = buildPrompt(text, fields);
   const provider = PROVIDERS[cfg.provider];
-  const maxRetries = 2;
-  let lastError: Error | null = null;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${cfg.apiKey}`,
+  };
+  if (provider.extraHeaders) Object.assign(headers, provider.extraHeaders);
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${cfg.apiKey}`,
-    };
-    if (provider.extraHeaders) Object.assign(headers, provider.extraHeaders);
-
-    const res = await fetch(`${provider.baseUrl}/chat/completions`, {
-      method: 'POST',
-      signal,
-      headers,
-      body: JSON.stringify({
-        model: cfg.model,
-        max_tokens: 16384,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      lastError = new Error(`AI 接口错误 ${res.status}: ${body.slice(0, 300)}`);
-      if (attempt < maxRetries) await new Promise((r) => setTimeout(r, 1000));
-      continue;
-    }
-    const data = await res.json();
-    const content = data?.choices?.[0]?.message?.content ?? '';
-    const fieldsResult = parseFieldsJson(content);
-    const usage = data?.usage;
-    if (fieldsResult._error) {
-      lastError = new Error(fieldsResult._error);
-      if (attempt < maxRetries) await new Promise((r) => setTimeout(r, 1000));
-      continue;
-    }
-    return { fields: fieldsResult, usage };
+  const res = await fetch(`${provider.baseUrl}/chat/completions`, {
+    method: 'POST',
+    signal,
+    headers,
+    body: JSON.stringify({
+      model: cfg.model,
+      max_tokens: 16384,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`AI 接口错误 ${res.status}: ${body.slice(0, 300)}`);
   }
-  throw lastError || new Error('AI 提取字段失败（未知错误）');
+  const data = await res.json();
+  const content = data?.choices?.[0]?.message?.content ?? '';
+  const fieldsResult = parseFieldsJson(content);
+  if (fieldsResult._error) throw new Error(fieldsResult._error);
+  return { fields: fieldsResult, usage: data?.usage };
+}
+
+/**
+ * 分批提取字段：把字段列表按每批 7 个拆分，逐批调用 AI 后合并结果。
+ * 好处：模型面对 28 个字段 + 14 万字符容易偷懒全填"未提及"，
+ * 拆小批次能逼它每批都认真提取；单批失败不影响其他批。
+ */
+export async function extractFields(
+  text: string,
+  fields: TargetField[],
+  cfg: AiConfig,
+  signal?: AbortSignal
+): Promise<{ fields: Record<string, string>; usage: any }> {
+  const CHUNK = 7;
+  const chunks: TargetField[][] = [];
+  for (let i = 0; i < fields.length; i += CHUNK) {
+    chunks.push(fields.slice(i, i + CHUNK));
+  }
+
+  const merged: Record<string, string> = {};
+  let usage: any;
+  let lastError: Error | null = null;
+  let okChunks = 0;
+
+  for (const chunk of chunks) {
+    // 每批内部最多重试 2 次
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      try {
+        const r = await callOnce(text, chunk, cfg, signal);
+        Object.assign(merged, r.fields);
+        usage = r.usage;
+        okChunks += 1;
+        lastError = null;
+        break;
+      } catch (e: any) {
+        if (e?.name === 'AbortError') throw e;
+        lastError = e instanceof Error ? e : new Error(String(e));
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  }
+
+  if (okChunks === 0) {
+    throw lastError || new Error('AI 提取字段失败（所有批次均失败）');
+  }
+  return { fields: merged, usage };
 }
