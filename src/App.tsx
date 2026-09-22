@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFields, PROVIDERS, ProviderId, TargetField, ExtractMode, isEmptyValue, isTemplateResidue, isDescriptionEcho } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isEmptyValue, isTemplateResidue, isDescriptionEcho } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -57,7 +57,7 @@ export default function App() {
   const [aiReturnPreview, setAiReturnPreview] = useState<string>('');
   // 提取模式：all=全部一次 / chunk=每批7个 / single=单字段逐个
   const [extractMode, setExtractMode] = useState<ExtractMode>('chunk');
-  // 解析字数上限：越小单次 AI 调用越快、越省额度；完整=15万
+  // 解析字数上限：越小单次 AI 调用越快、越省额度；0=智能分段（不限字数，自动切段补漏）
   const [parseLimit, setParseLimit] = useState<number>(150000);
   const [onlyEmpty, setOnlyEmpty] = useState(true);
   const [running, setRunning] = useState(false);
@@ -227,7 +227,7 @@ export default function App() {
 
           setState(job.recordId, { status: 'parsing', message: '解析 PDF' });
           const buf = await blob.arrayBuffer();
-          const { text, pages, truncated } = await parsePdf(buf, { maxChars: parseLimit });
+          const { text, pages, truncated } = await parsePdf(buf, { maxChars: parseLimit || 100000000 });
           if (text.trim().length < 50) throw new Error('PDF 几乎无文本层（可能是纯扫描件），暂不支持');
           setParsedChars(text.length);
 
@@ -246,16 +246,20 @@ export default function App() {
             message: `AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符 / ${targetFields.length} 字段${truncated ? '，已截断' : ''}）`,
           });
           const startedAt = Date.now();
+          let segInfo = '';
           const genTimer = setInterval(() => {
             const sec = Math.round((Date.now() - startedAt) / 1000);
             setState(job.recordId, {
               status: 'generating',
-              message: `AI 生成中（已 ${sec} 秒 / ${pages} 页 / ${text.length.toLocaleString()} 字符 / ${targetFields.length} 字段）`,
+              message: `AI 生成中${segInfo ? `（${segInfo}，已 ${sec} 秒）` : `（已 ${sec} 秒 / ${pages} 页 / ${text.length.toLocaleString()} 字符 / ${targetFields.length} 字段）`}`,
             });
           }, 3000);
           let extractResult: { fields: Record<string, string>; raws: string[] };
           try {
-            extractResult = await extractFields(text, targetFields, { provider, apiKey, model }, ac.signal, extractMode);
+            extractResult = await extractFieldsAuto(
+              text, targetFields, { provider, apiKey, model }, ac.signal, extractMode,
+              (i, n) => { segInfo = `第 ${i}/${n} 段`; }
+            );
           } finally {
             clearInterval(genTimer);
           }
@@ -474,9 +478,10 @@ export default function App() {
             onChange={(v) => setParseLimit(v as number)}
             style={{ width: '100%' }}
             optionList={[
-              { label: '完整 15 万字符（最全，最慢）', value: 150000 },
-              { label: '前 8 万字符（推荐，多数字段够用）', value: 80000 },
+              { label: '前 8 万字符（推荐，多数字段够用，快）', value: 80000 },
+              { label: '完整 15 万字符（最全，较慢）', value: 150000 },
               { label: '前 4 万字符（极速，适合只要标题/作者/摘要类）', value: 40000 },
+              { label: '智能分段·不限字数（长文献/书籍，自动切段补漏）', value: 0 },
             ]}
           />
         </Form.Slot>

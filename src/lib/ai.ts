@@ -318,3 +318,53 @@ export async function extractFields(
   }
   return { fields: merged, usage, raws };
 }
+
+/**
+ * 智能分段提取：全文超过单段上限时自动切段，后续段落只补提取仍缺的字段。
+ * - 第 1 段按指定模式提取全部字段；
+ * - 第 2 段起只提取第 1 段没拿到的字段（空值/未提及/模板残留都算缺）；
+ * - 所有字段都齐了立即停止，不读后面的段（长书通常前 1-2 段就够）；
+ * - 段间留少量重叠字符，避免句子/章节在切分边界被截断。
+ */
+export async function extractFieldsAuto(
+  text: string,
+  fields: TargetField[],
+  cfg: AiConfig,
+  signal?: AbortSignal,
+  mode: ExtractMode = 'chunk',
+  onProgress?: (segIndex: number, segTotal: number) => void
+): Promise<{ fields: Record<string, string>; raws: string[] }> {
+  const SEG = 140000;
+  const OVERLAP = 1500;
+
+  if (text.length <= SEG) {
+    const r = await extractFields(text, fields, cfg, signal, mode);
+    return { fields: r.fields, raws: r.raws };
+  }
+
+  // 切段（带重叠）
+  const segs: string[] = [];
+  for (let i = 0; i < text.length; i += SEG) {
+    segs.push(text.slice(i, i + SEG + OVERLAP));
+  }
+
+  const merged: Record<string, string> = {};
+  const raws: string[] = [];
+
+  for (let si = 0; si < segs.length; si++) {
+    onProgress?.(si + 1, segs.length);
+    // 仍缺的字段：空/未提及/模板残留/描述回声都视为没拿到
+    const missing = fields.filter((f) => {
+      const v = merged[f.name];
+      if (!v || !v.trim() || isEmptyValue(v) || isTemplateResidue(v)) return true;
+      return isDescriptionEcho(v, f.description);
+    });
+    if (!missing.length) break;
+
+    const r = await extractFields(segs[si], missing, cfg, signal, mode);
+    Object.assign(merged, r.fields);
+    raws.push(...r.raws.map((s) => `【第 ${si + 1}/${segs.length} 段】\n${s}`));
+  }
+
+  return { fields: merged, raws };
+}
