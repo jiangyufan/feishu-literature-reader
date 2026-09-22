@@ -112,11 +112,20 @@ export const PROVIDERS: Record<ProviderId, ProviderConfig> = {
 export function isEmptyValue(v: string): boolean {
   if (!v || !v.trim()) return true;
   const s = v.trim().toLowerCase();
+  // 精确/前后缀匹配的短占位词
   const empties = [
     '未提及', 'not mentioned', 'none', 'n/a', 'n\u200b/a', '无', '没有', '无法确定', '未能确定',
-    'not available', 'not applicable', 'unknown', '不存在', '不适合', 'not provided',
+    'not available', 'not applicable', 'unknown', '不存在', '不适合', 'not provided', '暂无',
+    '无作者信息', '无相关信息', '无有效信息', '无内容',
   ];
-  return empties.some((e) => s === e || s.startsWith(e) || s.endsWith(e));
+  if (empties.some((e) => s === e || s.startsWith(e) || s.endsWith(e))) return true;
+  // 包含式匹配的“推脱话术”（如“未提供文献全文”“文中未提及作者”“无法从文献中提取”）
+  const refusals = [
+    '未提供', '未给出', '未说明', '未明确', '未提及', '未涉及', '未找到', '未包含',
+    '文中未', '文献未', '文献中未', '无法提取', '无法判断', '无法从文献', '没有提供',
+    '没有提到', '未见', '缺少相关', '不包含', 'not mentioned in', 'not found in', 'not specified',
+  ];
+  return refusals.some((r) => s.includes(r));
 }
 
 /** 判断返回值是否仍是模板残留（如 [作者]、[年份]、……、...）或空括号 */
@@ -182,7 +191,8 @@ function buildPrompt(text: string, fields: TargetField[]): { system: string; use
   return {
     system: `你是一位学术文献阅读助手。下面是一份文献（论文、专著或整本书）经解析得到的全文文本，共 ${text.length} 个字符，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。`,
     user: `请从以下文献全文中提取以下字段的内容，严格输出 JSON（不要任何多余说明、不要 markdown 代码块以外的内容）。\n\n【字段列表】每个条目第一行是字段名（JSON 键名必须严格使用该字段名），第二行是该字段的提取要求：\n${fieldList}\n\n要求：\n- 所有字段值用简体中文填写（英文标题/作者/期刊名等专有名词保留原文）；\n- 若某字段在文中确实无法确定，值填 "未提及"；\n- 严禁全部字段都填 "未提及"，必须先从文本中认真提取；\n- JSON 键名只能是上面【字段列表】里的字段名，不能是描述文本；\n- 字段值中严禁出现任何 [xxx]、「……」、「...」等占位符或模板残留；
-- 如果某个字段在文献中确实只有概括性描述、没有具体实质内容，请直接填 "未提及"，不要 Echo 原始描述。`,
+- 如果某个字段在文献中确实只有概括性描述、没有具体实质内容，请直接填 "未提及"，不要 Echo 原始描述。
+- 空值只能填 "未提及" 这一个词，严禁自己编造"未提供文献全文""无作者信息""文中未找到"之类的说明性文字作为字段值。`,
   };
 }
 

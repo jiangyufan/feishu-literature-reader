@@ -12,7 +12,7 @@ import {
   Collapsible,
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { parsePdf } from './lib/pdf';
+import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
 import { extractFields, PROVIDERS, ProviderId, TargetField, isEmptyValue, isTemplateResidue, isDescriptionEcho } from './lib/ai';
 
 type RecState = {
@@ -51,6 +51,8 @@ export default function App() {
   const [model, setModel] = useState(PROVIDERS.siliconflow.models[0]);
   // 解析字符数统计（调试用）
   const [parsedChars, setParsedChars] = useState<number | null>(null);
+  // 最近一次解析的文本质量诊断 + 样本（调试用）
+  const [textQuality, setTextQuality] = useState<TextQuality | null>(null);
   const [onlyEmpty, setOnlyEmpty] = useState(true);
   const [running, setRunning] = useState(false);
   const [recs, setRecs] = useState<RecState[]>([]);
@@ -223,6 +225,16 @@ export default function App() {
           if (text.trim().length < 50) throw new Error('PDF 几乎无文本层（可能是纯扫描件），暂不支持');
           setParsedChars(text.length);
 
+          // 文本质量诊断：乱码/扫描件直接终止，不浪费 AI 调用
+          const quality = assessTextQuality(text);
+          setTextQuality(quality);
+          if (!quality.ok) {
+            setState(job.recordId, {
+              status: 'error',
+              message: `PDF 解析文本质量异常，已停止提取。${quality.reason}`,
+            });
+            continue;
+          }
           setState(job.recordId, {
             status: 'generating',
             message: `AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符 / ${targetFields.length} 字段${truncated ? '，已截断' : ''}）`,
@@ -331,7 +343,28 @@ export default function App() {
       {parsedChars !== null && (
         <div style={{ fontSize: 12, color: '#666', marginTop: 6 }}>
           上次解析总字符数：{parsedChars.toLocaleString()}
+          {textQuality && (
+            <span style={{ marginLeft: 8, color: textQuality.ok ? '#2ea44f' : '#d33' }}>
+              （可读率 {((textQuality.cjkRatio + textQuality.latinRatio) * 100).toFixed(1)}%{textQuality.ok ? '，正常' : '，异常！'}）
+            </span>
+          )}
         </div>
+      )}
+      {textQuality && !textQuality.ok && (
+        <Banner
+          type="danger"
+          closeIcon={null}
+          style={{ marginTop: 6 }}
+          description={textQuality.reason}
+        />
+      )}
+      {textQuality && (
+        <Collapsible style={{ marginTop: 6 }}>
+          <div style={{ fontSize: 12, color: '#666', background: '#f6f6f6', padding: 8, borderRadius: 6, wordBreak: 'break-all', maxHeight: 160, overflow: 'auto' }}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>解析文本开头 300 字样本（检查是否乱码）：</div>
+            {textQuality.sample || '（空）'}
+          </div>
+        </Collapsible>
       )}
       <Form labelPosition="top" style={{ marginTop: 10 }}>
         <Form.Slot label="数据表">
