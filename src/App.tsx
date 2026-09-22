@@ -60,6 +60,8 @@ export default function App() {
   // 解析字数上限：越小单次 AI 调用越快、越省额度；0=智能分段（不限字数，自动切段补漏）
   const [parseLimit, setParseLimit] = useState<number>(150000);
   const [onlyEmpty, setOnlyEmpty] = useState(true);
+  // 已提取判定阈值：有内容的目标字段数 ≥ 阈值即视为"已提取过"，批量时整行跳过；0 = 不跳过
+  const [skipThreshold, setSkipThreshold] = useState<number>(1);
   const [running, setRunning] = useState(false);
   const [recs, setRecs] = useState<RecState[]>([]);
   const abortRef = useRef<AbortController | null>(null);
@@ -152,31 +154,34 @@ export default function App() {
       const table = await bitable.base.getTableById(tableId);
       const recordIds = await table.getRecordIdList();
       
-      // 预扫记录：检查哪些行已全部提取过（所有目标字段都非空）
-      const allFieldsFilled = await Promise.all(
+      // 预扫记录：判断哪些行"已提取过"——统计非空目标字段数，达到阈值即视为已提取并跳过
+      // 注意：用 isEmptyValue 过滤，"无""未提及"这类占位词不算"有内容"
+      const prescan = await Promise.all(
         recordIds.map(async (rid) => {
           const rec = await table.getRecordById(rid);
           const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
-          const hasAttachment = atts?.[0]?.token;
-          if (!hasAttachment) return false;
-          if (!onlyEmpty) return true; // 如果允许覆盖，不跳过任何行
-          // 检查所有目标字段是否都已填充
+          const hasAttachment = !!atts?.[0]?.token;
+          if (!hasAttachment) return { hasAttachment, filled: 0, extracted: false };
+          if (!onlyEmpty || skipThreshold === 0) return { hasAttachment, filled: 0, extracted: false };
+          // 统计已填充的目标字段数（空值占位词不计入）
+          let filled = 0;
           for (const tf of targetFields) {
             const cur = (rec.fields as any)[tf.fieldId];
-            const curStr = Array.isArray(cur)
+            const curStr = (Array.isArray(cur)
               ? cur.map((s: any) => s?.text ?? s ?? '').join('')
-              : String(cur ?? '');
-            if (!curStr.trim()) return false; // 至少有一个字段为空
+              : String(cur ?? '')).trim();
+            if (curStr && !isEmptyValue(curStr) && !isTemplateResidue(curStr)) filled += 1;
           }
-          return true; // 所有字段都已填
+          return { hasAttachment, filled, extracted: filled >= skipThreshold };
         })
       );
+      const alreadyExtracted = prescan.map((p) => p.extracted);
 
       const jobs: RecState[] = [];
       const skipped: string[] = [];
       for (let i = 0; i < recordIds.length; i++) {
         const rid = recordIds[i];
-        if (!allFieldsFilled[i]) {
+        if (!alreadyExtracted[i]) {
           const rec = await table.getRecordById(rid);
           const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
           const first = atts?.[0];
@@ -190,7 +195,7 @@ export default function App() {
             });
           }
         } else {
-          // 已提取完，跳过
+          // 已提取过，跳过（显示判定依据：多少个字段已有内容）
           const rec = await table.getRecordById(rid);
           const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
           const name = atts?.[0]?.name || '未命名附件';
@@ -199,7 +204,7 @@ export default function App() {
             recordId: rid,
             name,
             status: 'skipped',
-            message: '已提取，跳过',
+            message: `已提取过（${prescan[i].filled}/${targetFields.length} 个字段已有内容），跳过`,
             skipped: true,
           });
         }
@@ -361,7 +366,7 @@ export default function App() {
     } finally {
       setRunning(false);
     }
-  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode, parseLimit]);
+  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode, parseLimit, skipThreshold]);
 
   const doneCount = recs.filter((r) => r.status === 'done').length;
   const skipCount = recs.filter((r) => r.status === 'skipped').length;
@@ -488,6 +493,20 @@ export default function App() {
         <Checkbox checked={onlyEmpty} onChange={(e) => setOnlyEmpty((e.target as any).checked)}>
           仅填充空字段（已有内容的字段不覆盖）
         </Checkbox>
+        <Form.Slot label="已提取判定（批量时整行跳过的条件）">
+          <Select
+            value={skipThreshold}
+            onChange={(v) => setSkipThreshold(v as number)}
+            style={{ width: '100%' }}
+            optionList={[
+              { label: '有 1 个字段有内容即跳过（推荐，提取过就算）', value: 1 },
+              { label: '有 3 个字段有内容才跳过', value: 3 },
+              { label: '有 5 个字段有内容才跳过', value: 5 },
+              { label: '全部字段都有内容才跳过（最严格）', value: 999 },
+              { label: '从不跳过（全部重新提取）', value: 0 },
+            ]}
+          />
+        </Form.Slot>
       </Form>
 
       {targetFields.length > 0 && (
