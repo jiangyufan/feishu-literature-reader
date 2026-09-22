@@ -104,8 +104,10 @@ export const PROVIDERS: Record<ProviderId, ProviderConfig> = {
     label: 'Kimi 官方',
     baseUrl: 'https://api.moonshot.cn/v1',
     apiKeyPlaceholder: 'sk-xxxxxxxx（Kimi 官方 API key）',
-    browserDirect: false, // 实测 CORS 不通过，需要说明
-    extraHeaders: { 'kimi-api-version': '2026-09-01-beta' },
+    // 2026-09-22 实测：CORS 预检已放行（allow-origin 回显请求 origin）。
+    // 注意：不能再带自定义头 kimi-api-version —— 带了它预检就不返回 allow-headers，
+    // 浏览器会拦截整个请求（之前"CORS 不通过"的根因就是这个头）。
+    browserDirect: true,
     models: KIMI_MODELS,
   },
 };

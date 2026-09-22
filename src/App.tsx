@@ -137,10 +137,6 @@ export default function App() {
       Toast.warning({ content: `请填写 ${PROVIDERS[provider].label} API Key` });
       return;
     }
-    if (provider === 'kimi') {
-      Toast.warning({ content: 'Kimi 官方 API 暂未开放浏览器直连，请先用硅基流动模型' });
-      return;
-    }
     if (!targetFields.length) {
       Toast.warning({ content: '当前表没有可提取的文本字段（请先建好带提示词的文本字段）' });
       return;
@@ -463,7 +459,7 @@ export default function App() {
           />
         </Form.Slot>
         {provider === 'kimi' && (
-          <Banner type="warning" closeIcon={null} description="Kimi 官方 API 暂未开放浏览器直连（CORS 限制），当前仅作配置预留，正式接入需后端代理。" />
+          <Banner type="info" closeIcon={null} description="Kimi 官方 API 已可浏览器直连（v6.3 修复）。提示：实测其模型解码较慢，追求速度建议用硅基流动 + DeepSeek-V4-Flash。" />
         )}
         <Form.Slot label="提取模式">
           <Select

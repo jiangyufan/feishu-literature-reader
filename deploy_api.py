@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.2 提速：默认模型 DeepSeek-V4-Flash + 默认一次提取（实测 7 分钟 -> 约 30 秒）'
+msg = 'deploy: v6.3 修复 Kimi 官方 CORS：移除导致预检失败的 kimi-api-version 头'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 
