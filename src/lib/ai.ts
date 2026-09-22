@@ -1,5 +1,9 @@
 // AI 生成层：OpenAI 兼容接口（v1 默认硅基流动直连；Kimi 官方需代理，后接）
-import { EXTRACTION_FIELDS } from './fields';
+export interface TargetField {
+  name: string;       // 字段名
+  fieldId: string;    // 字段 ID（用于写回）
+  description: string; // 字段描述（可选，来自表里的"提示词"或字段名本身）
+}
 
 export interface AiConfig {
   provider: 'siliconflow';
@@ -13,14 +17,17 @@ export const PROVIDERS = {
     baseUrl: 'https://api.siliconflow.cn/v1',
     models: ['Pro/moonshotai/Kimi-K2.6', 'moonshotai/Kimi-K2.7-Code'],
   },
-  // kimi 官方 api.moonshot.cn 浏览器直连被 CORS 拦截，待代理层就绪后开放
 };
 
-function buildPrompt(text: string): { system: string; user: string } {
-  const fieldDesc = EXTRACTION_FIELDS.map((f) => `- ${f.name}（${f.hint}）`).join('\n');
+/** 动态构建提示词：把用户定义的字段名+描述一起传给 AI */
+function buildPrompt(text: string, fields: TargetField[]): { system: string; user: string } {
+  const fieldList = fields.map((f, i) => {
+    const desc = f.description || f.name;
+    return `${i + 1}. **${f.name}**（要求：${desc}）`;
+  }).join('\n');
   return {
-    system: `你是一位学术文献阅读助手。下面是一份文献（可能是论文、专著或整本书）经 OCR/解析得到的全文文本，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。`,
-    user: `请从以下文献全文中提取信息，严格输出 JSON（不要任何多余说明、不要 markdown 代码块以外的内容），字段如下：\n${fieldDesc}\n\n要求：\n- 所有字段用简体中文填写（英文标题保留原文）；\n- 若某字段在文中确实无法确定，填 "未提及"；\n- 一句话摘要不超过 80 字。\n\n文献全文开始：\n${text}\n文献全文结束。`,
+    system: `你是一位学术文献阅读助手。下面是一份文献（论文、专著或整本书）经解析得到的全文文本，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。`,
+    user: `请从以下文献全文中提取以下字段的内容，严格输出 JSON（不要任何多余说明、不要 markdown 代码块以外的内容）：\n${fieldList}\n\n要求：\n- 所有字段用简体中文填写（英文标题保留原文）；\n- 若某字段在文中确实无法确定，填 "未提及"；\n- JSON 键名必须严格使用上面的字段名（包括中文名称）。`,
   };
 }
 
@@ -38,10 +45,11 @@ export function parseFieldsJson(raw: string): Record<string, string> {
 /** 调用 OpenAI 兼容 chat/completions 提取字段 */
 export async function extractFields(
   text: string,
+  fields: TargetField[],
   cfg: AiConfig,
   signal?: AbortSignal
 ): Promise<{ fields: Record<string, string>; usage: any }> {
-  const { system, user } = buildPrompt(text);
+  const { system, user } = buildPrompt(text, fields);
   const base = PROVIDERS[cfg.provider].baseUrl;
   const res = await fetch(`${base}/chat/completions`, {
     method: 'POST',
@@ -52,7 +60,7 @@ export async function extractFields(
     },
     body: JSON.stringify({
       model: cfg.model,
-      max_tokens: 4096,
+      max_tokens: 16384,
       messages: [
         { role: 'system', content: system },
         { role: 'user', content: user },
@@ -65,6 +73,6 @@ export async function extractFields(
   }
   const data = await res.json();
   const content = data?.choices?.[0]?.message?.content ?? '';
-  const fields = parseFieldsJson(content);
-  return { fields, usage: data?.usage };
+  const fieldsResult = parseFieldsJson(content);
+  return { fields: fieldsResult, usage: data?.usage };
 }
