@@ -282,8 +282,8 @@ export async function extractFields(
   let lastError: Error | null = null;
   let okChunks = 0;
 
-  for (const chunk of chunks) {
-    // 每批内部最多重试 2 次
+  /** 单批提取（带 2 次重试），返回是否成功 */
+  const runChunk = async (chunk: TargetField[]): Promise<boolean> => {
     for (let attempt = 0; attempt <= 2; attempt++) {
       try {
         const r = await callOnce(text, chunk, cfg, signal);
@@ -292,14 +292,26 @@ export async function extractFields(
         raws.push(`【批次：${chunk.map((f) => f.name).join('、')}】\n${r.raw}`);
         okChunks += 1;
         lastError = null;
-        break;
+        return true;
       } catch (e: any) {
         if (e?.name === 'AbortError') throw e;
         lastError = e instanceof Error ? e : new Error(String(e));
         if (attempt < 2) await new Promise((r) => setTimeout(r, 1000));
       }
     }
-  }
+    return false;
+  };
+
+  // 并行执行批次（最多 4 个同时进行），大幅缩短总耗时；abort 时立即抛出
+  const CONCURRENCY = 4;
+  let next = 0;
+  const workers = Array.from({ length: Math.min(CONCURRENCY, chunks.length) }, async () => {
+    while (next < chunks.length) {
+      const chunk = chunks[next++];
+      await runChunk(chunk);
+    }
+  });
+  await Promise.all(workers);
 
   if (okChunks === 0) {
     throw lastError || new Error('AI 提取字段失败（所有批次均失败）');

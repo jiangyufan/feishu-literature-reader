@@ -57,6 +57,8 @@ export default function App() {
   const [aiReturnPreview, setAiReturnPreview] = useState<string>('');
   // 提取模式：all=全部一次 / chunk=每批7个 / single=单字段逐个
   const [extractMode, setExtractMode] = useState<ExtractMode>('chunk');
+  // 解析字数上限：越小单次 AI 调用越快、越省额度；完整=15万
+  const [parseLimit, setParseLimit] = useState<number>(150000);
   const [onlyEmpty, setOnlyEmpty] = useState(true);
   const [running, setRunning] = useState(false);
   const [recs, setRecs] = useState<RecState[]>([]);
@@ -225,7 +227,7 @@ export default function App() {
 
           setState(job.recordId, { status: 'parsing', message: '解析 PDF' });
           const buf = await blob.arrayBuffer();
-          const { text, pages, truncated } = await parsePdf(buf, { maxChars: 150000 });
+          const { text, pages, truncated } = await parsePdf(buf, { maxChars: parseLimit });
           if (text.trim().length < 50) throw new Error('PDF 几乎无文本层（可能是纯扫描件），暂不支持');
           setParsedChars(text.length);
 
@@ -243,7 +245,23 @@ export default function App() {
             status: 'generating',
             message: `AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符 / ${targetFields.length} 字段${truncated ? '，已截断' : ''}）`,
           });
-          const { fields, raws } = await extractFields(text, targetFields, { provider, apiKey, model }, ac.signal, extractMode);
+          const startedAt = Date.now();
+          const genTimer = setInterval(() => {
+            const sec = Math.round((Date.now() - startedAt) / 1000);
+            setState(job.recordId, {
+              status: 'generating',
+              message: `AI 生成中（已 ${sec} 秒 / ${pages} 页 / ${text.length.toLocaleString()} 字符 / ${targetFields.length} 字段）`,
+            });
+          }, 3000);
+          let extractResult: { fields: Record<string, string>; raws: string[] };
+          try {
+            extractResult = await extractFields(text, targetFields, { provider, apiKey, model }, ac.signal, extractMode);
+          } finally {
+            clearInterval(genTimer);
+          }
+          const { fields, raws } = extractResult;
+          const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+          const elapsedStr = elapsedSec >= 60 ? `${Math.floor(elapsedSec / 60)} 分 ${elapsedSec % 60} 秒` : `${elapsedSec} 秒`;
 
           // 诊断：AI 原始返回 + 每个字段实际值（截断 30 字）
           setAiReturnPreview(
@@ -318,7 +336,7 @@ export default function App() {
           if (failCount > 0) parts.push(`失败 ${failCount} 个：${failedFields.join('、')}`);
           setState(job.recordId, {
             status: 'done',
-            message: `${parts.join('，')}（${text.length.toLocaleString()} 字符）；${diag}`,
+            message: `${parts.join('，')}，耗时 ${elapsedStr}（${text.length.toLocaleString()} 字符）；${diag}`,
             successCount,
             failCount,
           });
@@ -339,7 +357,7 @@ export default function App() {
     } finally {
       setRunning(false);
     }
-  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode]);
+  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode, parseLimit]);
 
   const doneCount = recs.filter((r) => r.status === 'done').length;
   const skipCount = recs.filter((r) => r.status === 'skipped').length;
@@ -447,6 +465,18 @@ export default function App() {
               { label: '每批 7 个字段（推荐，均衡）', value: 'chunk' },
               { label: '全部字段一次提取（快，易偷懒）', value: 'all' },
               { label: '单字段逐个提取（最准，最慢、费额度）', value: 'single' },
+            ]}
+          />
+        </Form.Slot>
+        <Form.Slot label="解析字数上限（越小越快越省额度）">
+          <Select
+            value={parseLimit}
+            onChange={(v) => setParseLimit(v as number)}
+            style={{ width: '100%' }}
+            optionList={[
+              { label: '完整 15 万字符（最全，最慢）', value: 150000 },
+              { label: '前 8 万字符（推荐，多数字段够用）', value: 80000 },
+              { label: '前 4 万字符（极速，适合只要标题/作者/摘要类）', value: 40000 },
             ]}
           />
         </Form.Slot>
