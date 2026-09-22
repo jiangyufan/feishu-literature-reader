@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.1 已提取判定阈值：批量时跳过提取过的记录'
+msg = 'deploy: v6.2 提速：默认模型 DeepSeek-V4-Flash + 默认一次提取（实测 7 分钟 -> 约 30 秒）'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 

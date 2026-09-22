@@ -24,22 +24,24 @@ export interface AiConfig {
   model: string;
 }
 
-// 硅基流动全部可用对话模型（按用户提供的清单整理的对话类/通用类）
+// 硅基流动可用对话模型（按 2026-09-22 实测速度排序：14.7万字符单批提取
+// DeepSeek-V4-Flash 10.7s ≪ GLM-5.2 76s ≪ Kimi-K2.7-Code 176s ≪ Qwen3.5-122B 247s）
 const SILICONFLOW_MODELS = [
-  // Kimi 系
-  'Pro/moonshotai/Kimi-K2.6',
+  // 实测最快·推荐（排第一=默认选中）
+  'deepseek-ai/DeepSeek-V4-Flash',
+  'deepseek-ai/DeepSeek-V3.2',
+  'zai-org/GLM-5.2',
+  // Kimi 系（实测较慢：14.7万字符单批约 3 分钟）
   'moonshotai/Kimi-K2.7-Code',
+  'Pro/moonshotai/Kimi-K2.6',
   // 腾讯混元
   'tencent/Hy4-preview',
   // 智谱 GLM
   'zai-org/GLM-5.3',
-  'zai-org/GLM-5.2',
   'zai-org/GLM-5.1',
   'Pro/zai-org/GLM-5.1',
   // DeepSeek
-  'deepseek-ai/DeepSeek-V4-Flash',
   'deepseek-ai/DeepSeek-V4-Pro',
-  'deepseek-ai/DeepSeek-V3.2',
   'Pro/deepseek-ai/DeepSeek-V3.2',
   'deepseek-ai/DeepSeek-V3.1-Terminus',
   'Pro/deepseek-ai/DeepSeek-V3.1-Terminus',
@@ -107,6 +109,13 @@ export const PROVIDERS: Record<ProviderId, ProviderConfig> = {
     models: KIMI_MODELS,
   },
 };
+
+/** 模型下拉框显示名：给实测结论加标注 */
+export function modelLabel(m: string): string {
+  if (m === 'deepseek-ai/DeepSeek-V4-Flash') return `${m}（实测最快·推荐）`;
+  if (m === 'moonshotai/Kimi-K2.7-Code') return `${m}（实测慢约 3 分钟/批）`;
+  return m;
+}
 
 /** 判断 AI 返回的值是否为空值占位词（不应写入表格） */
 export function isEmptyValue(v: string): boolean {

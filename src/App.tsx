@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isEmptyValue, isTemplateResidue, isDescriptionEcho } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isEmptyValue, isTemplateResidue, isDescriptionEcho, modelLabel } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -55,8 +55,8 @@ export default function App() {
   const [textQuality, setTextQuality] = useState<TextQuality | null>(null);
   // 最近一次 AI 对每个字段的返回值详情（调试用）
   const [aiReturnPreview, setAiReturnPreview] = useState<string>('');
-  // 提取模式：all=全部一次 / chunk=每批7个 / single=单字段逐个
-  const [extractMode, setExtractMode] = useState<ExtractMode>('chunk');
+  // 提取模式：all=全部一次（实测最快）/ chunk=每批7个 / single=单字段逐个
+  const [extractMode, setExtractMode] = useState<ExtractMode>('all');
   // 解析字数上限：越小单次 AI 调用越快、越省额度；0=智能分段（不限字数，自动切段补漏）
   const [parseLimit, setParseLimit] = useState<number>(150000);
   const [onlyEmpty, setOnlyEmpty] = useState(true);
@@ -459,7 +459,7 @@ export default function App() {
             value={model}
             onChange={(v) => setModel(v as string)}
             style={{ width: '100%' }}
-            optionList={PROVIDERS[provider].models.map((m) => ({ label: m, value: m }))}
+            optionList={PROVIDERS[provider].models.map((m) => ({ label: modelLabel(m), value: m }))}
           />
         </Form.Slot>
         {provider === 'kimi' && (
@@ -471,8 +471,8 @@ export default function App() {
             onChange={(v) => setExtractMode(v as ExtractMode)}
             style={{ width: '100%' }}
             optionList={[
-              { label: '每批 7 个字段（推荐，均衡）', value: 'chunk' },
-              { label: '全部字段一次提取（快，易偷懒）', value: 'all' },
+              { label: '全部字段一次提取（推荐·实测最快，14.7万字符约 30 秒）', value: 'all' },
+              { label: '每批 7 个字段（均衡，慢约 4 倍）', value: 'chunk' },
               { label: '单字段逐个提取（最准，最慢、费额度）', value: 'single' },
             ]}
           />
