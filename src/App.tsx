@@ -13,14 +13,18 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf } from './lib/pdf';
-import { extractFields, PROVIDERS, TargetField } from './lib/ai';
+import { extractFields, PROVIDERS, ProviderId, TargetField, isEmptyValue, isTemplateResidue } from './lib/ai';
 
 type RecState = {
   recordId: string;
   name: string;
   token?: string;
-  status: 'pending' | 'downloading' | 'parsing' | 'generating' | 'done' | 'error';
+  status: 'pending' | 'downloading' | 'parsing' | 'generating' | 'done' | 'skipped' | 'error';
   message: string;
+  skipped?: boolean;
+  successCount?: number;
+  failCount?: number;
+  failedFields?: string[];
 };
 
 const LS_KEY = 'literature_reader_cfg';
@@ -42,8 +46,11 @@ export default function App() {
   const [attachFieldId, setAttachFieldId] = useState<string>();
   const [attachFields, setAttachFields] = useState<{ label: string; value: string }[]>([]);
   const [targetFields, setTargetFields] = useState<TargetField[]>([]);
+  const [provider, setProvider] = useState<ProviderId>('siliconflow');
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState(PROVIDERS.siliconflow.models[0]);
+  // 解析字符数统计（调试用）
+  const [parsedChars, setParsedChars] = useState<number | null>(null);
   const [onlyEmpty, setOnlyEmpty] = useState(true);
   const [running, setRunning] = useState(false);
   const [recs, setRecs] = useState<RecState[]>([]);
@@ -61,8 +68,15 @@ export default function App() {
       .catch((e) => Toast.error({ content: `初始化失败：${String(e)}` }));
     try {
       const saved = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
+      if (saved.provider && PROVIDERS[saved.provider as ProviderId]) {
+        setProvider(saved.provider as ProviderId);
+      }
       if (saved.apiKey) setApiKey(saved.apiKey);
-      if (saved.model) setModel(saved.model);
+      if (saved.model) {
+        // 如果保存的模型当前 provider 没有，则 fallback 到该 provider 第一个
+        const list = PROVIDERS[saved.provider as ProviderId || provider].models;
+        setModel(list.includes(saved.model) ? saved.model : list[0]);
+      }
       if (typeof saved.onlyEmpty === 'boolean') setOnlyEmpty(saved.onlyEmpty);
     } catch { /* ignore */ }
   }, []);
@@ -100,8 +114,8 @@ export default function App() {
     loadTableConfig(tid);
   };
 
-  const saveCfg = (k: string, m: string, oe: boolean) => {
-    localStorage.setItem(LS_KEY, JSON.stringify({ apiKey: k, model: m, onlyEmpty: oe }));
+  const saveCfg = (p: ProviderId, k: string, m: string, oe: boolean) => {
+    localStorage.setItem(LS_KEY, JSON.stringify({ provider: p, apiKey: k, model: m, onlyEmpty: oe }));
   };
 
   const run = useCallback(async () => {
@@ -110,14 +124,18 @@ export default function App() {
       return;
     }
     if (!apiKey) {
-      Toast.warning({ content: '请填写硅基流动 API Key' });
+      Toast.warning({ content: `请填写 ${PROVIDERS[provider].label} API Key` });
+      return;
+    }
+    if (provider === 'kimi') {
+      Toast.warning({ content: 'Kimi 官方 API 暂未开放浏览器直连，请先用硅基流动模型' });
       return;
     }
     if (!targetFields.length) {
       Toast.warning({ content: '当前表没有可提取的文本字段（请先建好带提示词的文本字段）' });
       return;
     }
-    saveCfg(apiKey, model, onlyEmpty);
+    saveCfg(provider, apiKey, model, onlyEmpty);
     setRunning(true);
     const ac = new AbortController();
     abortRef.current = ac;
@@ -125,18 +143,56 @@ export default function App() {
     try {
       const table = await bitable.base.getTableById(tableId);
       const recordIds = await table.getRecordIdList();
+      
+      // 预扫记录：检查哪些行已全部提取过（所有目标字段都非空）
+      const allFieldsFilled = await Promise.all(
+        recordIds.map(async (rid) => {
+          const rec = await table.getRecordById(rid);
+          const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
+          const hasAttachment = atts?.[0]?.token;
+          if (!hasAttachment) return false;
+          if (!onlyEmpty) return true; // 如果允许覆盖，不跳过任何行
+          // 检查所有目标字段是否都已填充
+          for (const tf of targetFields) {
+            const cur = (rec.fields as any)[tf.fieldId];
+            const curStr = Array.isArray(cur)
+              ? cur.map((s: any) => s?.text ?? s ?? '').join('')
+              : String(cur ?? '');
+            if (!curStr.trim()) return false; // 至少有一个字段为空
+          }
+          return true; // 所有字段都已填
+        })
+      );
+
       const jobs: RecState[] = [];
-      for (const rid of recordIds) {
-        const rec = await table.getRecordById(rid);
-        const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
-        const first = atts?.[0];
-        if (first?.token) {
+      const skipped: string[] = [];
+      for (let i = 0; i < recordIds.length; i++) {
+        const rid = recordIds[i];
+        if (!allFieldsFilled[i]) {
+          const rec = await table.getRecordById(rid);
+          const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
+          const first = atts?.[0];
+          if (first?.token) {
+            jobs.push({
+              recordId: rid,
+              name: first.name || '未命名附件',
+              token: first.token,
+              status: 'pending',
+              message: '',
+            });
+          }
+        } else {
+          // 已提取完，跳过
+          const rec = await table.getRecordById(rid);
+          const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
+          const name = atts?.[0]?.name || '未命名附件';
+          skipped.push(rid);
           jobs.push({
             recordId: rid,
-            name: first.name || '未命名附件',
-            token: first.token,
-            status: 'pending',
-            message: '',
+            name,
+            status: 'skipped',
+            message: '已提取，跳过',
+            skipped: true,
           });
         }
       }
@@ -153,6 +209,8 @@ export default function App() {
 
       for (const job of jobs) {
         if (ac.signal.aborted) break;
+        if (job.skipped) continue; // 跳过已提取的行
+
         try {
           setState(job.recordId, { status: 'downloading', message: '下载附件' });
           const urls = await table.getCellAttachmentUrls([job.token as string], attachFieldId, job.recordId);
@@ -163,36 +221,80 @@ export default function App() {
           const buf = await blob.arrayBuffer();
           const { text, pages, truncated } = await parsePdf(buf, { maxChars: 150000 });
           if (text.trim().length < 50) throw new Error('PDF 几乎无文本层（可能是纯扫描件），暂不支持');
+          setParsedChars(text.length);
 
           setState(job.recordId, {
             status: 'generating',
-            message: `AI 生成中（${pages} 页 / ${targetFields.length} 字段${truncated ? '，已截断' : ''}）`,
+            message: `AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符 / ${targetFields.length} 字段${truncated ? '，已截断' : ''}）`,
           });
-          const { fields } = await extractFields(text, targetFields, { provider: 'siliconflow', apiKey, model }, ac.signal);
+          const { fields } = await extractFields(text, targetFields, { provider, apiKey, model }, ac.signal);
 
-          // 写回：按字段名匹配（忽略大小写/空格差异）
-          let filled = 0;
+          // 诊断：把 AI 返回的 key 列出来，便于排查字段名不匹配
+          const returnedKeys = Object.keys(fields)
+            .slice(0, 30)
+            .map((k) => `"${k}"`)
+            .join(', ');
+
+          // 逐字段写回（保护：单个字段失败不影响其他字段）
+          let successCount = 0;
+          let failCount = 0;
+          const failedFields: string[] = [];
+          
           for (const tf of targetFields) {
-            const key = Object.keys(fields).find(
-              (k) => k.trim().toLowerCase() === tf.name.trim().toLowerCase()
-            );
-            let v = key ? fields[key] : undefined;
-            if (typeof v !== 'string') v = (v as any)?.toString?.();
-            if (!v || !v.trim() || v.trim() === '未提及') continue;
-            if (onlyEmpty) {
-              const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
-              const curStr = Array.isArray(cur)
-                ? cur.map((s: any) => s?.text ?? s ?? '').join('')
-                : String(cur ?? '');
-              if (curStr.trim()) continue; // 已有内容则跳过
+            try {
+              const key = Object.keys(fields).find(
+                (k) => k.trim().toLowerCase() === tf.name.trim().toLowerCase()
+              );
+              let v = key ? fields[key] : undefined;
+              if (typeof v === 'string') {
+                // keep string
+              } else if (v != null && typeof (v as any).toString === 'function') {
+                v = (v as any).toString();
+              } else {
+                v = String(v ?? '');
+              }
+              if (!v || !v.trim() || isEmptyValue(v) || isTemplateResidue(v)) continue;
+              if (onlyEmpty) {
+                const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
+                const curStr = Array.isArray(cur)
+                  ? cur.map((s: any) => s?.text ?? s ?? '').join('')
+                  : String(cur ?? '');
+                if (curStr.trim()) continue; // 已有内容则跳过
+              }
+              await table.setCellValue(tf.fieldId, job.recordId, v.trim());
+              successCount += 1;
+            } catch (e: any) {
+              failCount += 1;
+              failedFields.push(tf.name);
             }
-            await table.setCellValue(tf.fieldId, job.recordId, v.trim());
-            filled += 1;
           }
-          setState(job.recordId, { status: 'done', message: `完成，写入 ${filled} 个字段` });
+          
+          const diag = `AI 返回字段名：[${returnedKeys}]`;
+          if (failCount > 0) {
+            setState(job.recordId, {
+              status: 'done',
+              message: `成功 ${successCount}/${targetFields.length}，失败 ${failCount} 个：${failedFields.join('、')}；${diag}`,
+              successCount,
+              failCount,
+              failedFields,
+            });
+          } else {
+            setState(job.recordId, {
+              status: 'done',
+              message: `完成，写入 ${successCount} 个有效字段（${text.length.toLocaleString()} 字符）；${diag}`,
+              successCount,
+            });
+          }
         } catch (e: any) {
           if (e?.name === 'AbortError') break;
-          setState(job.recordId, { status: 'error', message: String(e?.message || e).slice(0, 200) });
+          // 显示详细错误信息（含 AI 原始回复）
+          const msg = String(e?.message || e).slice(0, 500);
+          setState(job.recordId, {
+            status: 'error',
+            message: msg,
+            failCount: targetFields.length,
+            failedFields: targetFields.map(f => f.name),
+          });
         }
       }
     } catch (e: any) {
@@ -203,19 +305,25 @@ export default function App() {
   }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields]);
 
   const doneCount = recs.filter((r) => r.status === 'done').length;
+  const skipCount = recs.filter((r) => r.status === 'skipped').length;
   const statusText: Record<RecState['status'], string> = {
     pending: '等待', downloading: '下载附件', parsing: '解析 PDF',
-    generating: 'AI 生成中', done: '✅ 完成', error: '❌ 失败',
+    generating: 'AI 生成中', done: '✅ 完成', skipped: '⏭️ 已提取，跳过', error: '❌ 失败',
   };
 
   return (
     <main style={{ padding: 12, fontSize: 13 }}>
       <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器</h4>
-      <Banner
+        <Banner
         type="info"
         closeIcon={null}
         description="自动读取本表所有“文本”字段作为提取目标，字段名+字段描述即为提示词；按行一次提取全部，写回对应字段。解析在本地完成（免费）。"
       />
+      {parsedChars !== null && (
+        <div style={{ fontSize: 12, color: '#666', marginTop: 6 }}>
+          上次解析总字符数：{parsedChars.toLocaleString()}
+        </div>
+      )}
       <Form labelPosition="top" style={{ marginTop: 10 }}>
         <Form.Slot label="数据表">
           <Select
@@ -234,17 +342,37 @@ export default function App() {
             optionList={attachFields}
           />
         </Form.Slot>
-        <Form.Slot label="硅基流动 API Key">
-          <Input mode="password" value={apiKey} onChange={(v) => setApiKey(v)} placeholder="sk-..." />
+        <Form.Slot label="AI 平台">
+          <Select
+            value={provider}
+            onChange={(v) => {
+              const p = v as ProviderId;
+              setProvider(p);
+              setModel(PROVIDERS[p].models[0]);
+            }}
+            style={{ width: '100%' }}
+            optionList={Object.entries(PROVIDERS).map(([k, p]) => ({ label: p.label, value: k }))}
+          />
+        </Form.Slot>
+        <Form.Slot label={`${PROVIDERS[provider].label} API Key`}>
+          <Input
+            mode="password"
+            value={apiKey}
+            onChange={(v) => setApiKey(v)}
+            placeholder={PROVIDERS[provider].apiKeyPlaceholder}
+          />
         </Form.Slot>
         <Form.Slot label="模型">
           <Select
             value={model}
             onChange={(v) => setModel(v as string)}
             style={{ width: '100%' }}
-            optionList={PROVIDERS.siliconflow.models.map((m) => ({ label: m, value: m }))}
+            optionList={PROVIDERS[provider].models.map((m) => ({ label: m, value: m }))}
           />
         </Form.Slot>
+        {provider === 'kimi' && (
+          <Banner type="warning" closeIcon={null} description="Kimi 官方 API 暂未开放浏览器直连（CORS 限制），当前仅作配置预留，正式接入需后端代理。" />
+        )}
         <Checkbox checked={onlyEmpty} onChange={(e) => setOnlyEmpty((e.target as any).checked)}>
           仅填充空字段（已有内容的字段不覆盖）
         </Checkbox>
@@ -265,7 +393,9 @@ export default function App() {
 
       <div style={{ display: 'flex', gap: 8, margin: '10px 0' }}>
         <Button theme="solid" type="primary" loading={running} onClick={run}>
-          {running ? `处理中 ${doneCount}/${recs.length}` : '开始批量提取'}
+          {running
+            ? `处理中 ${doneCount}/${recs.length}（跳过 ${skipCount}）`
+            : '开始批量提取'}
         </Button>
         {running && <Button onClick={() => abortRef.current?.abort()}>停止</Button>}
       </div>
@@ -279,7 +409,7 @@ export default function App() {
                 {' '}{r.name}
               </div>
               <div style={{ color: r.status === 'error' ? '#d45' : '#888' }}>
-                {statusText[r.status]}{r.message && r.status !== 'done' ? ` · ${r.message}` : ''}
+                {statusText[r.status]}{r.message ? ` · ${r.message}` : ''}
               </div>
             </div>
           ))}
