@@ -238,9 +238,10 @@ export default function App() {
           // 逐字段写回（保护：单个字段失败不影响其他字段）
           let successCount = 0;
           let failCount = 0;
-          let filteredCount = 0;
+          let emptyCount = 0;      // AI 返回空/未提及/占位词
+          let echoCount = 0;       // AI 回声模板描述
+          let existingCount = 0;   // 字段已有内容且开启仅填充空字段
           const failedFields: string[] = [];
-          const filteredFields: string[] = [];
 
           for (const tf of targetFields) {
             try {
@@ -255,9 +256,12 @@ export default function App() {
               } else {
                 v = String(v ?? '');
               }
-              if (!v || !v.trim() || isEmptyValue(v) || isTemplateResidue(v) || isDescriptionEcho(v, tf.description)) {
-                filteredCount += 1;
-                filteredFields.push(tf.name);
+              if (!v || !v.trim() || isEmptyValue(v) || isTemplateResidue(v)) {
+                emptyCount += 1;
+                continue;
+              }
+              if (isDescriptionEcho(v, tf.description)) {
+                echoCount += 1;
                 continue;
               }
               if (onlyEmpty) {
@@ -266,8 +270,7 @@ export default function App() {
                   ? cur.map((s: any) => s?.text ?? s ?? '').join('')
                   : String(cur ?? '');
                 if (curStr.trim()) {
-                  filteredCount += 1;
-                  filteredFields.push(tf.name);
+                  existingCount += 1;
                   continue; // 已有内容则跳过
                 }
               }
@@ -281,7 +284,9 @@ export default function App() {
 
           const diag = `AI 返回字段名：[${returnedKeys}]`;
           const parts: string[] = [`写入 ${successCount}/${targetFields.length}`];
-          if (filteredCount > 0) parts.push(`过滤 ${filteredCount} 个（空/模板残留/已有内容）`);
+          if (emptyCount > 0) parts.push(`AI 未给出内容 ${emptyCount} 个`);
+          if (echoCount > 0) parts.push(`过滤回声 ${echoCount} 个`);
+          if (existingCount > 0) parts.push(`已有内容跳过 ${existingCount} 个`);
           if (failCount > 0) parts.push(`失败 ${failCount} 个：${failedFields.join('、')}`);
           setState(job.recordId, {
             status: 'done',
