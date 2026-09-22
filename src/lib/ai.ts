@@ -119,19 +119,54 @@ export function isEmptyValue(v: string): boolean {
   return empties.some((e) => s === e || s.startsWith(e) || s.endsWith(e));
 }
 
-/** 判断返回值是否仍是模板残留（如 [作者]、[年份]）或空括号 */
+/** 判断返回值是否仍是模板残留（如 [作者]、[年份]、……、...）或空括号 */
 export function isTemplateResidue(v: string): boolean {
   if (!v || !v.trim()) return true;
-  // 仍包含 [xxx] 占位符，说明 AI 没有替换，直接按空值丢弃
-  return /\[.+?\]/.test(v.trim());
+  const s = v.trim();
+  // 仍包含 [xxx] 占位符，说明 AI 没有替换
+  if (/\[.+?\]/.test(s)) return true;
+  // 包含连续省略号（半角 ... 或全角 ……），大概率是模板未填充
+  if (/\.{2,}|…{2,}/.test(s)) return true;
+  return false;
 }
 
-/** 清理字段描述中的模板占位符（如“[作者]，发表于[期刊]”），避免 AI 把占位符原样输出 */
+/** 简单文本归一化（去空白/标点/大小写），用于计算相似度 */
+function normalizeText(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/[\uff0c\u3002\u3001\uff1b\uff1a\u201c\u201d\u2018\u2019\u300c\u300d\u300e\u300f\uff08\uff09\(\)\[\]\{\}"'，。、；：！？!?]/g, '')
+    .replace(/\.{2,}|…{2,}/g, '');
+}
+
+/** 判断返回值是不是原始描述的“回声”（AI 没提取，直接把提示词改几个字返回） */
+export function isDescriptionEcho(value: string, description: string): boolean {
+  if (!value || !description) return false;
+  const v = value.trim();
+  const d = description.trim();
+  if (!v || !d) return false;
+  // 如果返回值里还含着原始描述的核心片段（>6 个字符），直接视为回声
+  const nd = normalizeText(d);
+  const nv = normalizeText(v);
+  if (nd.length >= 4) {
+    // 描述是返回值的子串（AI 加了几个字但骨架没变）
+    if (nv.includes(nd)) return true;
+    // 描述与返回值编辑距离很近（归一化后长度接近且交集大）
+    const commonLen = [...nv].filter((c) => nd.includes(c)).length; // 粗略公共字符数
+    const ratio = Math.min(commonLen / (nd.length || 1), commonLen / (nv.length || 1));
+    if (ratio > 0.6) return true;
+  }
+  return false;
+}
+
+/** 清理字段描述中的模板占位符（如“[作者]，发表于[期刊]” / “本文研究...机制”），避免 AI 把占位符原样输出 */
 function sanitizeDescription(desc: string, fieldName: string): string {
   let s = (desc || '').trim();
-  // 直接删除所有 [xxx] 占位符
-  s = s.replace(/\[.+?\]/g, '').trim();
-  // 清理残余标点（如“，发表于”变成“，发表于”或多余逗号）
+  // 删除 [xxx] 占位符
+  s = s.replace(/\[.+?\]/g, ' ').trim();
+  // 把 .../…… 这类省略占位符替换为“具体”二字，提示 AI 这里需要填真实内容
+  s = s.replace(/\.{2,}|…{2,}/g, '具体').trim();
+  // 清理残余标点和多余空白
   s = s.replace(/[，,；;]+\s*[，,；;]+/g, '，').replace(/^[，,；;]+|[，,；;]+$/g, '').trim();
   // 兜底说明
   if (!s) return `从文献中提取“${fieldName}”的对应内容`;
@@ -146,7 +181,8 @@ function buildPrompt(text: string, fields: TargetField[]): { system: string; use
   }).join('\n');
   return {
     system: `你是一位学术文献阅读助手。下面是一份文献（论文、专著或整本书）经解析得到的全文文本，共 ${text.length} 个字符，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。`,
-    user: `请从以下文献全文中提取以下字段的内容，严格输出 JSON（不要任何多余说明、不要 markdown 代码块以外的内容）。\n\n【字段列表】每个条目第一行是字段名（JSON 键名必须严格使用该字段名），第二行是该字段的提取要求：\n${fieldList}\n\n要求：\n- 所有字段值用简体中文填写（英文标题/作者/期刊名等专有名词保留原文）；\n- 若某字段在文中确实无法确定，值填 "未提及"；\n- 严禁全部字段都填 "未提及"，必须先从文本中认真提取；\n- JSON 键名只能是上面【字段列表】里的字段名，不能是描述文本；\n- 字段值中严禁出现任何 [xxx] 形式的占位符或模板残留。`,
+    user: `请从以下文献全文中提取以下字段的内容，严格输出 JSON（不要任何多余说明、不要 markdown 代码块以外的内容）。\n\n【字段列表】每个条目第一行是字段名（JSON 键名必须严格使用该字段名），第二行是该字段的提取要求：\n${fieldList}\n\n要求：\n- 所有字段值用简体中文填写（英文标题/作者/期刊名等专有名词保留原文）；\n- 若某字段在文中确实无法确定，值填 "未提及"；\n- 严禁全部字段都填 "未提及"，必须先从文本中认真提取；\n- JSON 键名只能是上面【字段列表】里的字段名，不能是描述文本；\n- 字段值中严禁出现任何 [xxx]、「……」、「...」等占位符或模板残留；
+- 如果某个字段在文献中确实只有概括性描述、没有具体实质内容，请直接填 "未提及"，不要 Echo 原始描述。`,
   };
 }
 

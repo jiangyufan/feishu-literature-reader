@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf } from './lib/pdf';
-import { extractFields, PROVIDERS, ProviderId, TargetField, isEmptyValue, isTemplateResidue } from './lib/ai';
+import { extractFields, PROVIDERS, ProviderId, TargetField, isEmptyValue, isTemplateResidue, isDescriptionEcho } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -238,8 +238,10 @@ export default function App() {
           // 逐字段写回（保护：单个字段失败不影响其他字段）
           let successCount = 0;
           let failCount = 0;
+          let filteredCount = 0;
           const failedFields: string[] = [];
-          
+          const filteredFields: string[] = [];
+
           for (const tf of targetFields) {
             try {
               const key = Object.keys(fields).find(
@@ -253,13 +255,21 @@ export default function App() {
               } else {
                 v = String(v ?? '');
               }
-              if (!v || !v.trim() || isEmptyValue(v) || isTemplateResidue(v)) continue;
+              if (!v || !v.trim() || isEmptyValue(v) || isTemplateResidue(v) || isDescriptionEcho(v, tf.description)) {
+                filteredCount += 1;
+                filteredFields.push(tf.name);
+                continue;
+              }
               if (onlyEmpty) {
                 const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
                 const curStr = Array.isArray(cur)
                   ? cur.map((s: any) => s?.text ?? s ?? '').join('')
                   : String(cur ?? '');
-                if (curStr.trim()) continue; // 已有内容则跳过
+                if (curStr.trim()) {
+                  filteredCount += 1;
+                  filteredFields.push(tf.name);
+                  continue; // 已有内容则跳过
+                }
               }
               await table.setCellValue(tf.fieldId, job.recordId, v.trim());
               successCount += 1;
@@ -268,23 +278,17 @@ export default function App() {
               failedFields.push(tf.name);
             }
           }
-          
+
           const diag = `AI 返回字段名：[${returnedKeys}]`;
-          if (failCount > 0) {
-            setState(job.recordId, {
-              status: 'done',
-              message: `成功 ${successCount}/${targetFields.length}，失败 ${failCount} 个：${failedFields.join('、')}；${diag}`,
-              successCount,
-              failCount,
-              failedFields,
-            });
-          } else {
-            setState(job.recordId, {
-              status: 'done',
-              message: `完成，写入 ${successCount} 个有效字段（${text.length.toLocaleString()} 字符）；${diag}`,
-              successCount,
-            });
-          }
+          const parts: string[] = [`写入 ${successCount}/${targetFields.length}`];
+          if (filteredCount > 0) parts.push(`过滤 ${filteredCount} 个（空/模板残留/已有内容）`);
+          if (failCount > 0) parts.push(`失败 ${failCount} 个：${failedFields.join('、')}`);
+          setState(job.recordId, {
+            status: 'done',
+            message: `${parts.join('，')}（${text.length.toLocaleString()} 字符）；${diag}`,
+            successCount,
+            failCount,
+          });
         } catch (e: any) {
           if (e?.name === 'AbortError') break;
           // 显示详细错误信息（含 AI 原始回复）
