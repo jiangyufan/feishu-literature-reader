@@ -459,7 +459,7 @@ export default function App() {
           />
         </Form.Slot>
         {provider === 'kimi' && (
-          <Banner type="info" closeIcon={null} description="Kimi 官方 API 已可浏览器直连（v6.3 修复）。提示：实测其模型解码较慢，追求速度建议用硅基流动 + DeepSeek-V4-Flash。" />
+          <Banner type="info" closeIcon={null} description="Kimi 官方 chat 接口已可浏览器直连（v6.3 修复）。但注意：Kimi 的 /v1/files 上传与读取接口因 CORS 无法在前端直连，本插件仍用浏览器解析 + 模型提取；且 Kimi 模型解码慢（实测约 3 分钟/批），追求速度建议切换到「硅基流动 + DeepSeek-V4-Flash」。" />
         )}
         <Form.Slot label="提取模式">
           <Select

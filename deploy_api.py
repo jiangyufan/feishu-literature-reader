@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.3 修复 Kimi 官方 CORS：移除导致预检失败的 kimi-api-version 头'
+msg = 'deploy: v6.3.1 Kimi 文件接口 CORS 不可直连说明 + 全 Kimi 模型标注慢'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 

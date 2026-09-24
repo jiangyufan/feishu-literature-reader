@@ -115,7 +115,8 @@ export const PROVIDERS: Record<ProviderId, ProviderConfig> = {
 /** 模型下拉框显示名：给实测结论加标注 */
 export function modelLabel(m: string): string {
   if (m === 'deepseek-ai/DeepSeek-V4-Flash') return `${m}（实测最快·推荐）`;
-  if (m === 'moonshotai/Kimi-K2.7-Code') return `${m}（实测慢约 3 分钟/批）`;
+  // 所有 Kimi K2/K3 系模型实测解码慢（单批 14.7万字符约 3 分钟），一律标注
+  if (/kimi/i.test(m)) return `${m}（实测慢·约 3 分钟/批，建议用硅基流动 + DeepSeek-V4-Flash）`;
   return m;
 }
 
