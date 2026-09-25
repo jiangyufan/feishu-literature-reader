@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, isTitleField, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -302,19 +302,29 @@ export default function App() {
         const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === tf.name.trim().toLowerCase());
         if (k) fields[k] = normalizeSpecialFieldValue(tf.name, typeof fields[k] === 'string' ? fields[k] : String(fields[k] ?? ''));
       }
-      // 精读重试：AI 返回无效值（未提及/拒答/占位符/引文串）的字段，改用精读模式（单字段+全文+该字段自己的提示词）再试一次。
-      // 标题类字段返回"无"也要重试确认一次（防止把有标题的文献误判为无标题）；确认后仍是"无"才接受为终值。
+      // 精读重试：AI 返回无效值（未提及/拒答/占位符/引文串/编造话术）的字段，改用精读模式（单字段+全文+该字段自己的提示词）再试一次。
+      // 标题/关键词/摘要/相关文献是高误报字段——批量模式下 AI 容易拿元数据凑数，故这四类字段即使返回了"看似有效"的值也要复核一次（信任精读结果）。
       const needsRetry = (f: TargetField): boolean => {
         const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === f.name.trim().toLowerCase());
         const v = k ? fields[k] : undefined;
         const s = v == null ? '' : String(v).trim();
         if (!isFieldValueValid(f.name, v, f.description)) return true;
         if (isTitleField(f.name) && s === '无') return true;
-        return false;
+        // 高误报字段：批量结果有值也要精读复核（精读带全文+专项规则，可信度更高）
+        return isTitleField(f.name) || isKeywordField(f.name) || isAbstractField(f.name) || isRelatedWorkField(f.name);
       };
-      const retryFields = extractList.filter(needsRetry).slice(0, 8);
+      // 排序：无效值字段（必须重试出结果）优先，有值的高风险复核字段排后，防止 slice 截断把无效字段挤掉
+      const retryAll = extractList.filter((f) => needsRetry(f));
+      const retryInvalid = retryAll.filter((f) => {
+        const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === f.name.trim().toLowerCase());
+        return !isFieldValueValid(f.name, k ? fields[k] : undefined, f.description);
+      });
+      const retryRecheck = retryAll.filter((f) => !retryInvalid.includes(f));
+      const retryFields = [...retryInvalid, ...retryRecheck].slice(0, 12);
       if (retryFields.length) {
-        setState({ status: 'generating', message: `${retryFields.length} 个字段首次未提出（${retryFields.map((f) => f.name).join('、')}），精读重试中…` });
+        const invalidMsg = retryInvalid.length ? `${retryInvalid.length} 个无效` : '';
+        const recheckMsg = retryRecheck.length ? `${retryRecheck.length} 个待复核` : '';
+        setState({ status: 'generating', message: `精读重试中（${[invalidMsg, recheckMsg].filter(Boolean).join(' + ')}：${retryFields.map((f) => f.name).join('、')}），耗时与字段数成正比…` });
         try {
           const r2 = await extractFieldsAuto(text, retryFields, { provider: opts.provider, apiKey: opts.apiKey, model: opts.model }, ac.signal, 'single');
           raws = [...raws, ...r2.raws];
@@ -322,10 +332,15 @@ export default function App() {
             const rf = retryFields.find((f) => f.name.trim().toLowerCase() === k.trim().toLowerCase());
             if (!rf) continue;
             const s = normalizeSpecialFieldValue(rf.name, (typeof vRaw === 'string' ? vRaw : String(vRaw)).trim());
+            const origKey = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === k.trim().toLowerCase());
             if (isFieldValueValid(rf.name, s, rf.description)) {
-              const orig = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === k.trim().toLowerCase());
-              if (orig) fields[orig] = s; else fields[k] = s;
+              // 精读结果有效 → 覆盖批量结果
+              if (origKey) fields[origKey] = s; else fields[k] = s;
+            } else if (retryInvalid.includes(rf)) {
+              // 无效字段精读仍无效 → 清掉批量阶段的垃圾值（拒答/编造/占位符），宁缺勿滥
+              if (origKey) delete fields[origKey]; else delete fields[k];
             }
+            // 高风险复核字段精读也无效 → 保留批量原值（批量结果可能仍是对的）
           }
         } catch { /* 重试失败不影响主结果 */ }
       }
@@ -468,7 +483,7 @@ export default function App() {
 
   return (
     <main style={{ padding: 12, fontSize: 13 }}>
-      <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器 <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>v6.11</span></h4>
+      <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器 <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>v6.12</span></h4>
         <Banner
         type="info"
         closeIcon={null}

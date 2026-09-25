@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.11 标题防呆版本机制:旧缓存/表格里的标题无与引文串未经精读确认视为可疑,自动复核重提并覆盖写入(修复英文文献英文标题被固化为无)'
+msg = 'deploy: v6.12 准确率优化:标题/关键词/摘要/相关文献四类高误报字段批量提取后强制精读复核(信任精读·无效则清空)+识别特刊节点名版权页串编造话术+Fields提示词元数据隔离'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 

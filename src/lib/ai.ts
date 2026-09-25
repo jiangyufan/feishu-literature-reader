@@ -190,10 +190,42 @@ export function isEnglishTitleField(fieldName: string): boolean {
   return n.includes('英文标题') || n.includes('英文题名') || /english\s*title|original\s*title/i.test(n);
 }
 
-/** 是否为标题类字段（英文标题/中文标题等）：提取质量要求最高 */
+/** 是否为标题类字段（英文标题/中文标题/中文题目等）：提取质量要求最高 */
 export function isTitleField(fieldName: string): boolean {
   const n = (fieldName || '').trim().toLowerCase();
-  return n.includes('标题') || n.includes('题名') || /title/i.test(n);
+  return n.includes('标题') || n.includes('题名') || n.includes('题目') || /title/i.test(n);
+}
+
+/** 是否为「关键词」类字段：只允许原文 Keywords 栏里的术语 */
+export function isKeywordField(fieldName: string): boolean {
+  const n = (fieldName || '').trim().toLowerCase();
+  return n.includes('关键词') || n.includes('关键字') || /keywords?/i.test(n);
+}
+
+/** 是否为「摘要」类字段（含一句话摘要）：必须概括研究内容本身 */
+export function isAbstractField(fieldName: string): boolean {
+  const n = (fieldName || '').trim().toLowerCase();
+  return n.includes('摘要') || /abstract|summary/i.test(n);
+}
+
+/** 是否为「相关文献/参考文献」类字段：只允许原文 References 列表里真实存在的条目 */
+export function isRelatedWorkField(fieldName: string): boolean {
+  const n = (fieldName || '').trim().toLowerCase();
+  return n.includes('相关文献') || n.includes('参考文献') || /related\s*work|references?\b/i.test(n);
+}
+
+/** 判断值是否是 AI 的"搜索式编造/操作指引"垃圾（如"根据您的要求，我通过“文章标题”搜索…"、"以下信息是虚构"）。
+ *  与 isEmptyValue 的拒答词互补：这里抓的是"假装帮用户搜索/承认虚构/教用户怎么搜"的话术。 */
+export function looksLikeFabrication(v: string): boolean {
+  const s = (v || '').trim();
+  if (!s) return false;
+  const markers = [
+    '根据您的要求', '以下信息是虚构', '并不代表真实的论文', '基于假设的，并不代表',
+    '仅供参考。如果您需要真实', '你可以按照上述步骤', '建议您访问', '建议您使用',
+    '搜索结果会显示', '打开google scholar', '在搜索框中输入', '我通过“', '我通过"',
+    'ndltd.ncl.edu.tw', 'airitilibrary.com', '无法直接访问互联网数据库', '进行实时搜索',
+  ];
+  return markers.some((m) => s.toLowerCase().includes(m.toLowerCase()));
 }
 
 /** 标题防呆版本：v2 起标题"无"/引文串必须经过单字段精读确认后才算终值。
@@ -216,6 +248,9 @@ export function looksLikeCitation(v: string): boolean {
   if (/\(\d{4}\)\s*[:：]?\s*\d{4,}/.test(s)) return true;    // "(2025) 106170" 文章号
   if (/\bdoi\b|10\.\d{4,}\//i.test(s)) return true;          // DOI
   if (/\bissn\b|\bisbn\b/i.test(s)) return true;             // ISSN/ISBN
+  if (/\bno\.\s*\d+.*\(\w+\s*\d{4}\)/i.test(s)) return true; // "No. 34 (July 2024)" 刊期号
+  if (/\d{4}年\d{1,2}月|投稿.{0,6}\d{4}年/.test(s)) return true; // "2024年2月投稿/出版时间" 出版流程串
+  if (/[《][^》]+[》][，,].*版社/.test(s)) return true;       // "书名，出版社，出版时间" 版权页串
   return false;
 }
 
@@ -239,6 +274,8 @@ export function isFieldValueValid(fieldName: string, v: string | null | undefine
   // 标题类字段返回了引文/出处串（AI 把引用格式当标题）→ 无效
   if (isTitleField(fieldName) && looksLikeCitation(s)) return false;
   if (isEmptyValue(s) || isTemplateResidue(s)) return false;
+  // AI 的"搜索式编造/操作指引"垃圾（伪装搜索结果、承认虚构、教用户去 Google Scholar）
+  if (looksLikeFabrication(s)) return false;
   if (description && isDescriptionEcho(s, description)) return false;
   return true;
 }
@@ -268,17 +305,32 @@ function buildPrompt(text: string, fields: TargetField[]): { system: string; use
   const etRule = etFields.length
     ? `\n- ${etFields.map((f) => `「${f.name}」`).join('、')}：如果文献本身没有英文（外文）标题（如纯中文论文、中文书籍），该字段值必须填 "无"，严禁把中文标题或中文书名当作英文标题填入；有英文标题时保留英文原文。`
     : '';
-  // 标题类字段：必须是文献自身的标题，严禁把引文/出处串当标题
+  // 标题类字段：必须是文献自身的标题，严禁把引文/出处串/特刊节点名当标题
   const titleFields = fields.filter((f) => isTitleField(f.name) && !isEnglishTitleField(f.name));
   const titleRule = titleFields.length
-    ? `\n- ${titleFields.map((f) => `「${f.name}」`).join('、')}：必须输出文献自身的标题（通常在首页/封面最显眼处），外文文献请翻译成通顺的简体中文；严禁输出引文/出处格式的字符串（含 "et al."、期刊名+卷(年份)+页码、DOI、ISSN 的都不是标题）。`
+    ? `\n- ${titleFields.map((f) => `「${f.name}」`).join('、')}：必须输出文献自身的标题（通常在首页/封面最显眼处、通常字号最大的一行文字），外文文献请翻译成通顺的简体中文；严禁输出以下内容充当标题：①引文/出处串（含 "et al."、期刊名+卷(年份)+页码、DOI、ISSN）；②期刊的特刊/专题/栏目（节点）名称——那是期刊这一期的话题名，不是本文的标题（例如论文标题行通常紧挨作者名，出现在特刊名之后）；③书名号里的中文书名（对论文类文献而言）。如果正文里找不到本文标题，填 "无"，不要拿别的东西凑数。`
+    : '';
+  // 关键词字段：只允许原文 Keywords 栏里的术语
+  const kwFields = fields.filter((f) => isKeywordField(f.name));
+  const kwRule = kwFields.length
+    ? `\n- ${kwFields.map((f) => `「${f.name}」`).join('、')}：只填原文 Keywords（关键词）栏中列出的术语（通常紧跟摘要之后，多条用分号或顿号分隔）；外文关键词翻译成中文；文献自己提出的关键概念可适当补充，但严禁把以下内容当关键词：作者姓名、期刊名、发表年份、数据库名、文献篇数、投稿/出版日期、出版社、ISBN、"Materiology and Variantology" 这类特刊/栏目名（那是期刊话题名不是本文关键词）。若原文没有 Keywords 栏，填 "未提及"。`
+    : '';
+  // 摘要字段：概括研究内容本身，严禁元数据
+  const absFields = fields.filter((f) => isAbstractField(f.name) && !looksLikeFabrication(f.name));
+  const absRule = absFields.length
+    ? `\n- ${absFields.map((f) => `「${f.name}」`).join('、')}：概括文献的研究内容本身（研究问题、方法、主要发现/结论），80-200 字；严禁把以下元数据写进摘要：作者名、期刊名、卷期年份、投稿/接收/出版日期、出版社、ISBN、数据库名、文献篇数、书名页/版权页信息。摘要内容必须能在【文献全文】中找到依据，不得与${fields.some((f) => f.name.includes('基础信息')) ? '「基础信息」' : '其他书目信息'}重复。`
+    : '';
+  // 相关文献字段：只允许原文 References 里真实存在的条目
+  const rwFields = fields.filter((f) => isRelatedWorkField(f.name));
+  const rwRule = rwFields.length
+    ? `\n- ${rwFields.map((f) => `「${f.name}」`).join('、')}：从文末参考文献（References）列表中挑出最相关的 3-5 条，逐条列出"作者. 标题. 出处. 年份"，格式参考原文献的著录方式（如 GB/T 7714 或文中既有格式）；严禁编造原文参考文献列表中不存在的文献；严禁插入任何互联网搜索行为、操作指引（"打开 Google Scholar"等）或"无法访问互联网"之类的说明——你手上就是全文，文末就有真实参考文献。若确实无参考文献栏，填 "未提及"。`
     : '';
   return {
-    system: `你是一位学术文献阅读助手。下面是一份文献（论文、专著或整本书）经解析得到的全文文本，共 ${text.length} 个字符，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。`,
-    user: `请从以下文献全文中提取以下字段的内容，严格输出 JSON（不要任何多余说明、不要 markdown 代码块以外的内容）。\n\n【字段列表】每个条目第一行是字段名（JSON 键名必须严格使用该字段名），第二行是该字段的提取要求：\n${fieldList}\n\n要求：\n- 所有字段值用简体中文填写（英文标题/作者/期刊名等专有名词保留原文）；\n- 若某字段在文中确实无法确定，值填 "未提及"；\n- 严禁全部字段都填 "未提及"，必须先从文本中认真提取；\n- JSON 键名只能是上面【字段列表】里的字段名，不能是描述文本；\n- 字段值中严禁出现任何 [xxx]、「……」、「...」等占位符或模板残留；
+    system: `你是一位学术文献阅读助手。下面是一份文献（论文、专著或整本书）经解析得到的全文文本，共 ${text.length} 个字符，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。你没有联网能力，也不需要联网——所有答案都在文本里。`,
+    user: `请从以下文献全文中提取以下字段的内容，严格输出 JSON（不要任何多余说明、不要 markdown 代码块以外的内容）。\n\n【字段列表】每个条目第一行是字段名（JSON 键名必须严格使用该字段名），第二行是该字段的提取要求：\n${fieldList}\n\n要求：\n- 提取的内容必须真实来自【文献全文】：字段值中的每个事实（人名/数据/结论）都要能在原文中找到出处，严禁凭空编造或用外部知识补齐；\n- 所有字段值用简体中文填写（英文标题/作者/期刊名等专有名词保留原文）；\n- 若某字段在文中确实无法确定，值填 "未提及"；\n- 严禁全部字段都填 "未提及"，必须先从文本中认真提取；\n- JSON 键名只能是上面【字段列表】里的字段名，不能是描述文本；\n- 字段值中严禁出现任何 [xxx]、「……」、「...」等占位符或模板残留；
 - 如果某个字段在文献中确实只有概括性描述、没有具体实质内容，请直接填 "未提及"，不要 Echo 原始描述。
 - 空值只能填 "未提及" 这一个词，严禁自己编造"未提供文献全文""无作者信息""文中未找到"之类的说明性文字作为字段值。
-- 内容要具体、有信息量：写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；字段要求里有字数上限的，在上限内尽量写充实。${etRule}${titleRule}
+- 内容要具体、有信息量：写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；字段要求里有字数上限的，在上限内尽量写充实。${etRule}${titleRule}${kwRule}${absRule}${rwRule}
 
 【文献全文】
 ${text}`,
@@ -320,11 +372,21 @@ async function callOnce(
     const etRule = isEnglishTitleField(f.name)
       ? `\n- 特别规则：如果该文献本身没有英文（外文）标题（如纯中文论文、中文书籍），只填 "无" 一个词，严禁把中文标题或中文书名当作英文标题；有英文标题时保留英文原文。`
       : '';
-    // 标题类字段：只输出标题本身，严禁引文/出处串
+    // 标题类字段：只输出标题本身，严禁引文/出处串/特刊节点名/版权页串
     const titleRule = isTitleField(f.name) && !isEnglishTitleField(f.name)
-      ? `\n- 特别规则：只输出文献自身的标题本身（通常在首页/封面最显眼处），外文文献翻译成通顺简体中文；严禁输出引文/出处格式（含 "et al."、期刊名+卷(年份)+页码、DOI、ISSN 的都不是标题），也不要带作者、出版信息。`
+      ? `\n- 特别规则：只输出文献自身的标题本身（通常在首页/封面最显眼处、通常字号最大的独立一行，紧挨作者名之前或之后），外文文献翻译成通顺简体中文；严禁把以下内容当标题：引文/出处串（et al./卷(年份)/DOI/ISSN）、期刊特刊/专题（节点）名称、报告编号、"No. 34 (July 2024)" 刊期号、版权页字符串。若确实找不到本文标题，只填 "无"。`
       : '';
-    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 内容要具体、有信息量，写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。${etRule}${titleRule}\n\n【文献全文】\n${text}`;
+    // 关键词/摘要/相关文献的精读专项规则
+    const kwRule = isKeywordField(f.name)
+      ? `\n- 特别规则：只填原文 Keywords（关键词）栏中的术语（外文关键词翻译成中文）；严禁把作者/期刊/年份/数据库名/特刊名当关键词；原文没有 Keywords 栏时只填 "未提及"。`
+      : '';
+    const absRule = isAbstractField(f.name)
+      ? `\n- 特别规则：概括研究内容本身（问题/方法/发现），80-200 字；严禁写作者名、期刊/出版社、投稿出版日期、ISBN 等任何元数据。`
+      : '';
+    const rwRule = isRelatedWorkField(f.name)
+      ? `\n- 特别规则：从文末 References 列表挑最相关的 3-5 条原样著录；严禁编造文献、严禁任何搜索指引或拒答话术；无 References 栏时只填 "未提及"。`
+      : '';
+    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 内容要具体、有信息量，写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。${etRule}${titleRule}${kwRule}${absRule}${rwRule}\n\n【文献全文】\n${text}`;
   } else {
     ({ system, user } = buildPrompt(text, fields));
   }
