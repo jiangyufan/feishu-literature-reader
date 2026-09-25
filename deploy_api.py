@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.12.1 用户提示词含联网/搜索/链接类指令时覆盖为安全默认指令(根除相关文献编造源头)+摘要/关键词元数据罗列(作者:xxx;期刊:xxx)切段硬校验'
+msg = 'deploy: v6.13 writeFields 新增残留清理——本次提取判定无效的字段，若表格里留着旧一轮(旧版插件)写入的拒答话术/编造链接/元数据罗列/引文串，自动清空该单元格'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 

@@ -77,8 +77,8 @@ async function writeFields(
   effectiveFields: TargetField[],
   onlyEmpty: boolean,
   titlesTrusted: boolean
-): Promise<{ successCount: number; failCount: number; emptyCount: number; echoCount: number; existingCount: number; failedFields: string[] }> {
-  let successCount = 0, failCount = 0, emptyCount = 0, echoCount = 0, existingCount = 0;
+): Promise<{ successCount: number; failCount: number; emptyCount: number; echoCount: number; existingCount: number; failedFields: string[]; clearedCount: number }> {
+  let successCount = 0, failCount = 0, emptyCount = 0, echoCount = 0, existingCount = 0, clearedCount = 0;
   const failedFields: string[] = [];
   for (const tf of effectiveFields) {
     try {
@@ -106,7 +106,26 @@ async function writeFields(
       failedFields.push(tf.name);
     }
   }
-  return { successCount, failCount, emptyCount, echoCount, existingCount, failedFields };
+  // v6.13 洗刷残留：本次提取判定为无效的字段（值缺失/被防呆删除），如果表格里还留着
+  // 旧一轮（旧版插件）写入的垃圾值（拒答话术/编造链接/元数据罗列/引文串），清空它。
+  // 否则会出现"新逻辑删了值，但表格里旧垃圾没人擦"——导出 Excel 时旧垃圾原样带出。
+  for (const tf of effectiveFields) {
+    try {
+      const key = Object.keys(fields).find((k) => k.trim().toLowerCase() === tf.name.trim().toLowerCase());
+      const hasNew = key != null && fields[key] != null && String(fields[key]).trim() !== '';
+      if (hasNew) continue; // 本次有值已正常写入（或写入被 onlyEmpty 跳过但值合法），无需清理
+      const rec = await table.getRecordById(job.recordId);
+      const cur = rec.fields[tf.fieldId];
+      const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
+      if (!curStr) continue;
+      const curLooksGarbage = !isFieldValueValid(tf.name, curStr, tf.description)
+        || (titleNeedsRecheck(tf.name, curStr) && !titlesTrusted);
+      if (!curLooksGarbage) continue; // 旧值合法（如英文标题的"无"、用户手工填的正确值）→ 不动
+      await table.setCellValue(tf.fieldId, job.recordId, '');
+      clearedCount += 1;
+    } catch { /* 清理失败不影响主流程 */ }
+  }
+  return { successCount, failCount, emptyCount, echoCount, existingCount, failedFields, clearedCount };
 }
 
 export default function App() {
@@ -483,7 +502,7 @@ export default function App() {
 
   return (
     <main style={{ padding: 12, fontSize: 13 }}>
-      <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器 <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>v6.12.1</span></h4>
+      <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器 <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>v6.13</span></h4>
         <Banner
         type="info"
         closeIcon={null}
