@@ -265,6 +265,28 @@ export function normalizeSpecialFieldValue(fieldName: string, v: string): string
   return v;
 }
 
+/** 值是否是"署名/版权页式元数据串"（大量"标签：内容"片段组成的污染值，如摘要/关键词被写成
+ *  "作者：xxx；单位：xxx；期刊：xxx；DOI：xxx"）。摘要/关键词命中 → 无效，触发重提。 */
+export function looksLikeMetadataDump(fieldName: string, v: string): boolean {
+  // 只对摘要/关键词类字段生效（基础信息/文章信息类字段本来就允许元数据）
+  if (!isAbstractField(fieldName) && !isKeywordField(fieldName)) return false;
+  const s = (v || '').trim();
+  if (!s) return false;
+  // 统计"标签："模式（中英文冒号都算）：按分隔符切段，每段开头命中标签表即计一次
+  const labels = ['作者', '单位', '通讯作者', '期刊', '发表', '出版', '出版社', '版权', 'ISBN', 'DOI', '卷', '期', '页码', '字数', '丛书', '数据库', '文献来源', 'Corresponding author', 'Affiliation', 'Volume', 'Issue'];
+  const segs = s.split(/[，,；;。.\n]/);
+  let labelCount = 0;
+  for (const seg of segs) {
+    const t = seg.trim().toLowerCase();
+    if (!t) continue;
+    for (const lb of labels) {
+      if (t.startsWith(lb.toLowerCase() + '：') || t.startsWith(lb.toLowerCase() + ':')) { labelCount++; break; }
+    }
+  }
+  if (labelCount >= 3) return true; // 3 个以上"标签："→ 元数据罗列，不是内容概括
+  return false;
+}
+
 /** 字段值是否为有效终值（可直接写入表格 / 视为"已提取"）。
  * 注意：「英文标题」的"无"是合法终值（确实没有英文标题），不能再当成空值反复重提。 */
 export function isFieldValueValid(fieldName: string, v: string | null | undefined, description = ''): boolean {
@@ -276,8 +298,32 @@ export function isFieldValueValid(fieldName: string, v: string | null | undefine
   if (isEmptyValue(s) || isTemplateResidue(s)) return false;
   // AI 的"搜索式编造/操作指引"垃圾（伪装搜索结果、承认虚构、教用户去 Google Scholar）
   if (looksLikeFabrication(s)) return false;
+  // 摘要/关键词被写成"作者：xxx；单位：xxx"式元数据罗列 → 无效，触发重提
+  if (looksLikeMetadataDump(fieldName, s)) return false;
   if (description && isDescriptionEcho(s, description)) return false;
   return true;
+}
+
+/** 危险提示词检测：字段描述里命令 AI 联网搜索/输出链接，这正是"编造文献"的源头。
+ *  命中则丢弃用户描述，改用安全的默认指令。 */
+function overrideDangerousDescription(desc: string, fieldName: string): { desc: string; overridden: boolean } {
+  const s = (desc || '').trim();
+  const dangerous = [
+    '搜索', 'search', '检索', 'google scholar', '开源数据库', '数据库搜索',
+    '链接', '网址', 'url', 'http', '网上', '联网', '实时', '导入文献管理系统',
+  ];
+  const hit = dangerous.some((d) => s.toLowerCase().includes(d));
+  const defaults: Record<string, string> = {
+    related_work: '从文献文末的参考文献（References）列表中，挑选与本文献主题最相关的 3-5 条文献，按原文著录格式逐条列出（作者. 标题. 出处. 年份）；只允许列表中真实存在的条目',
+    keyword: '提取文献原文 Keywords（关键词）栏中的术语；外文关键词译成中文；原文没有 Keywords 栏时填“未提及”',
+  };
+  let kind = '';
+  if (isRelatedWorkField(fieldName)) kind = 'related_work';
+  else if (isKeywordField(fieldName)) kind = 'keyword';
+  // 用户的描述命令联网搜索 → 一律覆盖为安全指令
+  if (kind && hit) return { desc: defaults[kind], overridden: true };
+  if (isRelatedWorkField(fieldName) && !s) return { desc: defaults.related_work, overridden: true };
+  return { desc: s, overridden: false };
 }
 
 /** 清理字段描述中的模板占位符（如"[作者]，发表于[期刊]" / "本文研究...机制"），避免 AI 把占位符原样输出 */
@@ -289,6 +335,9 @@ function sanitizeDescription(desc: string, fieldName: string): string {
   s = s.replace(/\.{2,}|…{2,}/g, '具体').trim();
   // 清理残余标点和多余空白
   s = s.replace(/[，,；;]+\s*[，,；;]+/g, '，').replace(/^[，,；;]+|[，,；;]+$/g, '').trim();
+  // 相关文献/关键词类字段：描述里含"联网搜索"等危险指令 → 覆盖为安全默认指令（防 AI 编造文献）
+  const ov = overrideDangerousDescription(s, fieldName);
+  if (ov.overridden) return ov.desc;
   // 兜底说明
   if (!s) return `从文献中提取“${fieldName}”的对应内容`;
   return s;

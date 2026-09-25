@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.12 准确率优化:标题/关键词/摘要/相关文献四类高误报字段批量提取后强制精读复核(信任精读·无效则清空)+识别特刊节点名版权页串编造话术+Fields提示词元数据隔离'
+msg = 'deploy: v6.12.1 用户提示词含联网/搜索/链接类指令时覆盖为安全默认指令(根除相关文献编造源头)+摘要/关键词元数据罗列(作者:xxx;期刊:xxx)切段硬校验'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 
