@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isEmptyValue, isTemplateResidue, isDescriptionEcho, modelLabel } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isEmptyValue, isTemplateResidue, isDescriptionEcho, modelLabel, pickCoreFields } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -28,6 +28,7 @@ type RecState = {
 };
 
 const LS_KEY = 'literature_reader_cfg';
+const CACHE_PREFIX = 'litcache:';
 
 /** 把 js-sdk 字段描述（可能为 {content:[{text}]} 或字符串）提取为纯文本提示词 */
 function descToText(d: any): string {
@@ -38,6 +39,59 @@ function descToText(d: any): string {
   }
   if (typeof d?.content === 'string') return d.content;
   return '';
+}
+
+/** 缓存键：记录 ID + 附件 token（token 随重新上传变化，避免误命中旧缓存） */
+function cacheKey(recordId: string, token?: string): string {
+  return CACHE_PREFIX + recordId + ':' + (token || '');
+}
+function getCache(key: string): Record<string, string> | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    return obj?.fields && typeof obj.fields === 'object' ? obj.fields : null;
+  } catch {
+    return null;
+  }
+}
+function setCache(key: string, fields: Record<string, string>) {
+  try {
+    localStorage.setItem(key, JSON.stringify({ fields, ts: Date.now() }));
+  } catch { /* 配额超限忽略 */ }
+}
+
+/** 把提取结果逐字段写回表格（保护：单字段失败不影响其他）。只遍历实际提取的 effectiveFields。 */
+async function writeFields(
+  table: any,
+  job: RecState,
+  fields: Record<string, string>,
+  effectiveFields: TargetField[],
+  onlyEmpty: boolean
+): Promise<{ successCount: number; failCount: number; emptyCount: number; echoCount: number; existingCount: number; failedFields: string[] }> {
+  let successCount = 0, failCount = 0, emptyCount = 0, echoCount = 0, existingCount = 0;
+  const failedFields: string[] = [];
+  for (const tf of effectiveFields) {
+    try {
+      const key = Object.keys(fields).find((k) => k.trim().toLowerCase() === tf.name.trim().toLowerCase());
+      let v = key ? fields[key] : undefined;
+      if (v == null) { emptyCount += 1; continue; }
+      v = typeof v === 'string' ? v : String(v);
+      if (!v.trim() || isEmptyValue(v) || isTemplateResidue(v)) { emptyCount += 1; continue; }
+      if (isDescriptionEcho(v, tf.description)) { echoCount += 1; continue; }
+      if (onlyEmpty) {
+        const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
+        const curStr = Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '');
+        if (curStr.trim()) { existingCount += 1; continue; }
+      }
+      await table.setCellValue(tf.fieldId, job.recordId, v.trim());
+      successCount += 1;
+    } catch (e: any) {
+      failCount += 1;
+      failedFields.push(tf.name);
+    }
+  }
+  return { successCount, failCount, emptyCount, echoCount, existingCount, failedFields };
 }
 
 export default function App() {
@@ -62,6 +116,12 @@ export default function App() {
   const [onlyEmpty, setOnlyEmpty] = useState(true);
   // 已提取判定阈值：有内容的目标字段数 ≥ 阈值即视为"已提取过"，批量时整行跳过；0 = 不跳过
   const [skipThreshold, setSkipThreshold] = useState<number>(1);
+  // 快速模式：只提取核心字段（约 10 个），输出 token 砍到 1/3，实测 ~8-10s
+  const [quickMode, setQuickMode] = useState(false);
+  // 强制重新提取：忽略本地缓存（用于覆盖错误结果）
+  const [forceRefresh, setForceRefresh] = useState(false);
+  // 后台预提取进行中（只缓存不写字段）
+  const [prerunning, setPrerunning] = useState(false);
   const [running, setRunning] = useState(false);
   const [recs, setRecs] = useState<RecState[]>([]);
   const abortRef = useRef<AbortController | null>(null);
@@ -128,241 +188,174 @@ export default function App() {
     localStorage.setItem(LS_KEY, JSON.stringify({ provider: p, apiKey: k, model: m, onlyEmpty: oe }));
   };
 
+  // 单条记录处理：缓存命中则秒出；否则 下载→解析→AI提取→（可选）写回→缓存
+  const processJob = useCallback(async (
+    job: RecState,
+    table: any,
+    ac: AbortController,
+    opts: {
+      write: boolean; useCache: boolean; forceRefresh: boolean;
+      effectiveFields: TargetField[]; extractMode: ExtractMode; parseLimit: number;
+      onlyEmpty: boolean; provider: ProviderId; apiKey: string; model: string;
+    }
+  ) => {
+    const setState = (patch: Partial<RecState>) =>
+      setRecs((prev) => prev.map((r) => (r.recordId === job.recordId ? { ...r, ...patch } : r)));
+    const key = cacheKey(job.recordId, job.token);
+    // 1) 缓存命中 → 秒出（或仅标记已缓存）
+    if (opts.useCache && !opts.forceRefresh) {
+      const cached = getCache(key);
+      if (cached) {
+        if (opts.write) {
+          const w = await writeFields(table, job, cached, opts.effectiveFields, opts.onlyEmpty);
+          const parts = [`写入 ${w.successCount}/${opts.effectiveFields.length}`];
+          if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
+          if (w.existingCount) parts.push(`已有跳过 ${w.existingCount}`);
+          if (w.failCount) parts.push(`失败 ${w.failCount}`);
+          setState({ status: 'done', message: `缓存秒出 · ${parts.join('，')}`, successCount: w.successCount, failCount: w.failCount });
+        } else {
+          setState({ status: 'done', message: '已缓存（点“开始批量提取”即可秒出）', successCount: opts.effectiveFields.length });
+        }
+        return;
+      }
+    }
+    // 2) 全量流水线
+    try {
+      setState({ status: 'downloading', message: '下载附件' });
+      const urls = await table.getCellAttachmentUrls([job.token as string], attachFieldId, job.recordId);
+      if (!urls?.length) throw new Error('获取附件链接失败');
+      const blob = await (await fetch(urls[0])).blob();
+      setState({ status: 'parsing', message: '解析 PDF' });
+      const buf = await blob.arrayBuffer();
+      const { text, pages, truncated } = await parsePdf(buf, { maxChars: opts.parseLimit || 100000000 });
+      if (text.trim().length < 50) throw new Error('PDF 几乎无文本层（可能是纯扫描件），暂不支持');
+      setParsedChars(text.length);
+      const quality = assessTextQuality(text);
+      setTextQuality(quality);
+      if (!quality.ok) {
+        setState({ status: 'error', message: `PDF 解析文本质量异常，已停止。${quality.reason}` });
+        return;
+      }
+      setState({ status: 'generating', message: `AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符 / ${opts.effectiveFields.length} 字段${truncated ? '，已截断' : ''}）` });
+      const startedAt = Date.now();
+      let segInfo = '';
+      const timer = setInterval(() => {
+        const sec = Math.round((Date.now() - startedAt) / 1000);
+        setState({ status: 'generating', message: `AI 生成中${segInfo ? `（${segInfo}）` : ''} · 已 ${sec} 秒` });
+      }, 3000);
+      let extractResult: { fields: Record<string, string>; raws: string[] };
+      try {
+        extractResult = await extractFieldsAuto(text, opts.effectiveFields, { provider: opts.provider, apiKey: opts.apiKey, model: opts.model }, ac.signal, opts.extractMode, (i, n) => { segInfo = `第 ${i}/${n} 段`; });
+      } finally { clearInterval(timer); }
+      const { fields, raws } = extractResult;
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      const elapsedStr = elapsed >= 60 ? `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒` : `${elapsed} 秒`;
+      setAiReturnPreview(
+        (raws.length ? `===== AI 原始返回 =====\n${raws.join('\n\n')}\n\n` : '') +
+        '===== 解析后的字段值 =====\n' +
+        Object.entries(fields).map(([k, v]) => `${k} = ${(typeof v === 'string' ? v : String(v)).slice(0, 30)}${(typeof v === 'string' ? v : String(v)).length > 30 ? '…' : ''}`).join('\n')
+      );
+      setCache(key, fields);
+      if (opts.write) {
+        const w = await writeFields(table, job, fields, opts.effectiveFields, opts.onlyEmpty);
+        const parts = [`写入 ${w.successCount}/${opts.effectiveFields.length}`];
+        if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
+        if (w.echoCount) parts.push(`过滤回声 ${w.echoCount}`);
+        if (w.existingCount) parts.push(`已有跳过 ${w.existingCount}`);
+        if (w.failCount) parts.push(`失败 ${w.failCount}：${w.failedFields.join('、')}`);
+        setState({ status: 'done', message: `${parts.join('，')}，耗时 ${elapsedStr}`, successCount: w.successCount, failCount: w.failCount });
+      } else {
+        setState({ status: 'done', message: `已缓存 · 提取 ${Object.keys(fields).length} 字段，耗时 ${elapsedStr}`, successCount: Object.keys(fields).length });
+      }
+    } catch (e: any) {
+      if (e?.name === 'AbortError') { setState({ status: 'error', message: '已停止' }); return; }
+      setState({ status: 'error', message: String(e?.message || e).slice(0, 500), failCount: opts.effectiveFields.length, failedFields: opts.effectiveFields.map((f) => f.name) });
+    }
+  }, [attachFieldId]);
+
   const run = useCallback(async () => {
-    if (!tableId || !attachFieldId) {
-      Toast.warning({ content: '请先选择数据表和附件字段' });
-      return;
-    }
-    if (!apiKey) {
-      Toast.warning({ content: `请填写 ${PROVIDERS[provider].label} API Key` });
-      return;
-    }
-    if (!targetFields.length) {
-      Toast.warning({ content: '当前表没有可提取的文本字段（请先建好带提示词的文本字段）' });
-      return;
-    }
+    if (!tableId || !attachFieldId) { Toast.warning({ content: '请先选择数据表和附件字段' }); return; }
+    if (!apiKey) { Toast.warning({ content: `请填写 ${PROVIDERS[provider].label} API Key` }); return; }
+    const effectiveFields = quickMode ? pickCoreFields(targetFields) : targetFields;
+    if (!effectiveFields.length) { Toast.warning({ content: '当前表没有可提取的文本字段（请先建好带提示词的文本字段）' }); return; }
     saveCfg(provider, apiKey, model, onlyEmpty);
     setRunning(true);
     const ac = new AbortController();
     abortRef.current = ac;
-
     try {
       const table = await bitable.base.getTableById(tableId);
       const recordIds = await table.getRecordIdList();
-      
-      // 预扫记录：判断哪些行"已提取过"——统计非空目标字段数，达到阈值即视为已提取并跳过
-      // 注意：用 isEmptyValue 过滤，"无""未提及"这类占位词不算"有内容"
-      const prescan = await Promise.all(
-        recordIds.map(async (rid) => {
-          const rec = await table.getRecordById(rid);
-          const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
-          const hasAttachment = !!atts?.[0]?.token;
-          if (!hasAttachment) return { hasAttachment, filled: 0, extracted: false };
-          if (!onlyEmpty || skipThreshold === 0) return { hasAttachment, filled: 0, extracted: false };
-          // 统计已填充的目标字段数（空值占位词不计入）
-          let filled = 0;
-          for (const tf of targetFields) {
-            const cur = (rec.fields as any)[tf.fieldId];
-            const curStr = (Array.isArray(cur)
-              ? cur.map((s: any) => s?.text ?? s ?? '').join('')
-              : String(cur ?? '')).trim();
-            if (curStr && !isEmptyValue(curStr) && !isTemplateResidue(curStr)) filled += 1;
-          }
-          return { hasAttachment, filled, extracted: filled >= skipThreshold };
-        })
-      );
-      const alreadyExtracted = prescan.map((p) => p.extracted);
-
+      // 预扫：已提取过的行整行跳过（统计非空目标字段数）
+      const prescan = await Promise.all(recordIds.map(async (rid) => {
+        const rec = await table.getRecordById(rid);
+        const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
+        if (!atts?.[0]?.token) return { filled: 0, extracted: false };
+        if (!onlyEmpty || skipThreshold === 0) return { filled: 0, extracted: false };
+        let filled = 0;
+        for (const tf of targetFields) {
+          const cur = (rec.fields as any)[tf.fieldId];
+          const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
+          if (curStr && !isEmptyValue(curStr) && !isTemplateResidue(curStr)) filled += 1;
+        }
+        return { filled, extracted: filled >= skipThreshold };
+      }));
       const jobs: RecState[] = [];
-      const skipped: string[] = [];
       for (let i = 0; i < recordIds.length; i++) {
-        const rid = recordIds[i];
-        if (!alreadyExtracted[i]) {
-          const rec = await table.getRecordById(rid);
-          const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
-          const first = atts?.[0];
-          if (first?.token) {
-            jobs.push({
-              recordId: rid,
-              name: first.name || '未命名附件',
-              token: first.token,
-              status: 'pending',
-              message: '',
-            });
-          }
+        const rec = await table.getRecordById(recordIds[i]);
+        const first = (rec.fields as any)[attachFieldId]?.[0];
+        if (!first?.token) continue;
+        if (prescan[i].extracted) {
+          jobs.push({ recordId: recordIds[i], name: first.name || '未命名附件', status: 'skipped', message: `已提取过（${prescan[i].filled}/${targetFields.length} 个字段已有内容），跳过`, skipped: true });
         } else {
-          // 已提取过，跳过（显示判定依据：多少个字段已有内容）
-          const rec = await table.getRecordById(rid);
-          const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
-          const name = atts?.[0]?.name || '未命名附件';
-          skipped.push(rid);
-          jobs.push({
-            recordId: rid,
-            name,
-            status: 'skipped',
-            message: `已提取过（${prescan[i].filled}/${targetFields.length} 个字段已有内容），跳过`,
-            skipped: true,
-          });
+          jobs.push({ recordId: recordIds[i], name: first.name || '未命名附件', token: first.token, status: 'pending', message: '' });
         }
       }
       setRecs(jobs);
-      if (!jobs.length) {
-        Toast.warning({ content: '未找到带附件的记录' });
-        setRunning(false);
-        return;
-      }
-
-      const setState = (rid: string, patch: Partial<RecState>) => {
-        setRecs((prev) => prev.map((r) => (r.recordId === rid ? { ...r, ...patch } : r)));
-      };
-
+      if (!jobs.length) { Toast.warning({ content: '未找到带附件的记录' }); setRunning(false); return; }
       for (const job of jobs) {
         if (ac.signal.aborted) break;
-        if (job.skipped) continue; // 跳过已提取的行
-
-        try {
-          setState(job.recordId, { status: 'downloading', message: '下载附件' });
-          const urls = await table.getCellAttachmentUrls([job.token as string], attachFieldId, job.recordId);
-          if (!urls?.length) throw new Error('获取附件链接失败');
-          const blob = await (await fetch(urls[0])).blob();
-
-          setState(job.recordId, { status: 'parsing', message: '解析 PDF' });
-          const buf = await blob.arrayBuffer();
-          const { text, pages, truncated } = await parsePdf(buf, { maxChars: parseLimit || 100000000 });
-          if (text.trim().length < 50) throw new Error('PDF 几乎无文本层（可能是纯扫描件），暂不支持');
-          setParsedChars(text.length);
-
-          // 文本质量诊断：乱码/扫描件直接终止，不浪费 AI 调用
-          const quality = assessTextQuality(text);
-          setTextQuality(quality);
-          if (!quality.ok) {
-            setState(job.recordId, {
-              status: 'error',
-              message: `PDF 解析文本质量异常，已停止提取。${quality.reason}`,
-            });
-            continue;
-          }
-          setState(job.recordId, {
-            status: 'generating',
-            message: `AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符 / ${targetFields.length} 字段${truncated ? '，已截断' : ''}）`,
-          });
-          const startedAt = Date.now();
-          let segInfo = '';
-          const genTimer = setInterval(() => {
-            const sec = Math.round((Date.now() - startedAt) / 1000);
-            setState(job.recordId, {
-              status: 'generating',
-              message: `AI 生成中${segInfo ? `（${segInfo}，已 ${sec} 秒）` : `（已 ${sec} 秒 / ${pages} 页 / ${text.length.toLocaleString()} 字符 / ${targetFields.length} 字段）`}`,
-            });
-          }, 3000);
-          let extractResult: { fields: Record<string, string>; raws: string[] };
-          try {
-            extractResult = await extractFieldsAuto(
-              text, targetFields, { provider, apiKey, model }, ac.signal, extractMode,
-              (i, n) => { segInfo = `第 ${i}/${n} 段`; }
-            );
-          } finally {
-            clearInterval(genTimer);
-          }
-          const { fields, raws } = extractResult;
-          const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
-          const elapsedStr = elapsedSec >= 60 ? `${Math.floor(elapsedSec / 60)} 分 ${elapsedSec % 60} 秒` : `${elapsedSec} 秒`;
-
-          // 诊断：AI 原始返回 + 每个字段实际值（截断 30 字）
-          setAiReturnPreview(
-            (raws.length ? `===== AI 原始返回 =====\n${raws.join('\n\n')}\n\n` : '') +
-            '===== 解析后的字段值 =====\n' +
-            Object.entries(fields)
-              .map(([k, v]) => {
-                const s = typeof v === 'string' ? v : String(v ?? '');
-                return `${k} = ${s.slice(0, 30)}${s.length > 30 ? '…' : ''}`;
-              })
-              .join('\n')
-          );
-
-          // 诊断：把 AI 返回的 key 列出来，便于排查字段名不匹配
-          const returnedKeys = Object.keys(fields)
-            .slice(0, 30)
-            .map((k) => `"${k}"`)
-            .join(', ');
-
-          // 逐字段写回（保护：单个字段失败不影响其他字段）
-          let successCount = 0;
-          let failCount = 0;
-          let emptyCount = 0;      // AI 返回空/未提及/占位词
-          let echoCount = 0;       // AI 回声模板描述
-          let existingCount = 0;   // 字段已有内容且开启仅填充空字段
-          const failedFields: string[] = [];
-
-          for (const tf of targetFields) {
-            try {
-              const key = Object.keys(fields).find(
-                (k) => k.trim().toLowerCase() === tf.name.trim().toLowerCase()
-              );
-              let v = key ? fields[key] : undefined;
-              if (typeof v === 'string') {
-                // keep string
-              } else if (v != null && typeof (v as any).toString === 'function') {
-                v = (v as any).toString();
-              } else {
-                v = String(v ?? '');
-              }
-              if (!v || !v.trim() || isEmptyValue(v) || isTemplateResidue(v)) {
-                emptyCount += 1;
-                continue;
-              }
-              if (isDescriptionEcho(v, tf.description)) {
-                echoCount += 1;
-                continue;
-              }
-              if (onlyEmpty) {
-                const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
-                const curStr = Array.isArray(cur)
-                  ? cur.map((s: any) => s?.text ?? s ?? '').join('')
-                  : String(cur ?? '');
-                if (curStr.trim()) {
-                  existingCount += 1;
-                  continue; // 已有内容则跳过
-                }
-              }
-              await table.setCellValue(tf.fieldId, job.recordId, v.trim());
-              successCount += 1;
-            } catch (e: any) {
-              failCount += 1;
-              failedFields.push(tf.name);
-            }
-          }
-
-          const diag = `AI 返回字段名：[${returnedKeys}]`;
-          const parts: string[] = [`写入 ${successCount}/${targetFields.length}`];
-          if (emptyCount > 0) parts.push(`AI 未给出内容 ${emptyCount} 个`);
-          if (echoCount > 0) parts.push(`过滤回声 ${echoCount} 个`);
-          if (existingCount > 0) parts.push(`已有内容跳过 ${existingCount} 个`);
-          if (failCount > 0) parts.push(`失败 ${failCount} 个：${failedFields.join('、')}`);
-          setState(job.recordId, {
-            status: 'done',
-            message: `${parts.join('，')}，耗时 ${elapsedStr}（${text.length.toLocaleString()} 字符）；${diag}`,
-            successCount,
-            failCount,
-          });
-        } catch (e: any) {
-          if (e?.name === 'AbortError') break;
-          // 显示详细错误信息（含 AI 原始回复）
-          const msg = String(e?.message || e).slice(0, 500);
-          setState(job.recordId, {
-            status: 'error',
-            message: msg,
-            failCount: targetFields.length,
-            failedFields: targetFields.map(f => f.name),
-          });
-        }
+        if (job.skipped) continue;
+        await processJob(job, table, ac, { write: true, useCache: true, forceRefresh, effectiveFields, extractMode, parseLimit, onlyEmpty, provider, apiKey, model });
       }
     } catch (e: any) {
       Toast.error({ content: `执行出错：${String(e?.message || e)}` });
     } finally {
       setRunning(false);
     }
-  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode, parseLimit, skipThreshold]);
+  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode, parseLimit, skipThreshold, quickMode, forceRefresh, processJob]);
+
+  const runPreExtract = useCallback(async () => {
+    if (!tableId || !attachFieldId) { Toast.warning({ content: '请先选择数据表和附件字段' }); return; }
+    if (!apiKey) { Toast.warning({ content: `请填写 ${PROVIDERS[provider].label} API Key` }); return; }
+    const effectiveFields = quickMode ? pickCoreFields(targetFields) : targetFields;
+    if (!effectiveFields.length) { Toast.warning({ content: '当前表没有可提取的文本字段' }); return; }
+    saveCfg(provider, apiKey, model, onlyEmpty);
+    setPrerunning(true);
+    const ac = new AbortController();
+    abortRef.current = ac;
+    try {
+      const table = await bitable.base.getTableById(tableId);
+      const recordIds = await table.getRecordIdList();
+      const jobs: RecState[] = [];
+      for (const rid of recordIds) {
+        const rec = await table.getRecordById(rid);
+        const first = (rec.fields as any)[attachFieldId]?.[0];
+        if (first?.token) jobs.push({ recordId: rid, name: first.name || '未命名附件', token: first.token, status: 'pending', message: '' });
+      }
+      setRecs(jobs);
+      if (!jobs.length) { Toast.warning({ content: '未找到带附件的记录' }); setPrerunning(false); return; }
+      for (const job of jobs) {
+        if (ac.signal.aborted) break;
+        await processJob(job, table, ac, { write: false, useCache: true, forceRefresh: false, effectiveFields, extractMode, parseLimit, onlyEmpty, provider, apiKey, model });
+      }
+      Toast.success({ content: `后台预提取完成，已缓存 ${jobs.length} 篇；点“开始批量提取”即可秒出` });
+    } catch (e: any) {
+      Toast.error({ content: `执行出错：${String(e?.message || e)}` });
+    } finally {
+      setPrerunning(false);
+    }
+  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode, parseLimit, quickMode, processJob]);
+
 
   const doneCount = recs.filter((r) => r.status === 'done').length;
   const skipCount = recs.filter((r) => r.status === 'skipped').length;
@@ -377,7 +370,7 @@ export default function App() {
         <Banner
         type="info"
         closeIcon={null}
-        description="自动读取本表所有“文本”字段作为提取目标，字段名+字段描述即为提示词；按行一次提取全部，写回对应字段。解析在本地完成（免费）。"
+        description="自动读取本表所有“文本”字段作为提取目标，字段名+字段描述即为提示词；按行提取并写回对应字段。解析在本地完成（免费）。结果按记录缓存到浏览器本地：下次同篇直接秒出；也可先“后台预提取”缓存，再秒写。"
       />
       {parsedChars !== null && (
         <div style={{ fontSize: 12, color: '#666', marginTop: 6 }}>
@@ -489,6 +482,12 @@ export default function App() {
         <Checkbox checked={onlyEmpty} onChange={(e) => setOnlyEmpty((e.target as any).checked)}>
           仅填充空字段（已有内容的字段不覆盖）
         </Checkbox>
+        <Checkbox checked={quickMode} onChange={(e) => setQuickMode((e.target as any).checked)}>
+          快速模式（仅提取核心字段，输出 token 砍到约 1/3，实测 ~8-10 秒）
+        </Checkbox>
+        <Checkbox checked={forceRefresh} onChange={(e) => setForceRefresh((e.target as any).checked)}>
+          强制重新提取（忽略本地缓存，覆盖旧结果）
+        </Checkbox>
         <Form.Slot label="已提取判定（批量时整行跳过的条件）">
           <Select
             value={skipThreshold}
@@ -506,9 +505,9 @@ export default function App() {
       </Form>
 
       {targetFields.length > 0 && (
-        <Collapsible title={`将提取 ${targetFields.length} 个字段`} style={{ margin: '6px 0' }}>
+        <Collapsible title={`将提取 ${quickMode ? pickCoreFields(targetFields).length : targetFields.length} 个字段${quickMode ? '（快速模式·核心字段子集）' : ''}`} style={{ margin: '6px 0' }}>
           <ul style={{ margin: 4, paddingLeft: 18, maxHeight: 180, overflowY: 'auto', color: '#555' }}>
-            {targetFields.map((f) => (
+            {(quickMode ? pickCoreFields(targetFields) : targetFields).map((f) => (
               <li key={f.fieldId}>
                 <b>{f.name}</b>
                 {f.description ? ` — ${f.description}` : '（无描述，按字段名提取）'}
@@ -518,14 +517,22 @@ export default function App() {
         </Collapsible>
       )}
 
-      <div style={{ display: 'flex', gap: 8, margin: '10px 0' }}>
+      <div style={{ display: 'flex', gap: 8, margin: '10px 0', flexWrap: 'wrap' }}>
         <Button theme="solid" type="primary" loading={running} onClick={run}>
           {running
             ? `处理中 ${doneCount}/${recs.length}（跳过 ${skipCount}）`
             : '开始批量提取'}
         </Button>
         {running && <Button onClick={() => abortRef.current?.abort()}>停止</Button>}
+        <Button loading={prerunning} onClick={runPreExtract}>
+          {prerunning ? `后台预提取中…` : '后台预提取(缓存)'}
+        </Button>
       </div>
+      {prerunning && (
+        <div style={{ fontSize: 12, color: '#666', marginTop: -4 }}>
+          后台预提取：逐篇提取并缓存到本地（不写字段）。完成后点“开始批量提取”即可秒出，面板关闭也不丢失。
+        </div>
+      )}
 
       {recs.length > 0 && (
         <div style={{ maxHeight: 300, overflowY: 'auto', borderTop: '1px solid #eee' }}>

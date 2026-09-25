@@ -112,6 +112,24 @@ export const PROVIDERS: Record<ProviderId, ProviderConfig> = {
   },
 };
 
+/**
+ * 快速模式核心字段：只提取这些“高频、信息密度高”的字段。
+ * 匹配方式：目标字段名包含下面任一关键词即入选（不区分大小写）。
+ * 目的：把 28 字段的输出 token 砍到约 1/3，实测提取耗时从 ~23s 降到 ~8-10s。
+ */
+export const CORE_FIELD_HINTS = [
+  '作者', '年份', '标题', '摘要', '结论', '方法', '创新', '关键词', '学科', '优先级',
+  '期刊', '出版社', '研究目的', '一句话', '研究背景',
+];
+
+/** 从全部目标字段中挑出“核心字段”子集；若匹配不足 2 个则回退到全部（避免空提取） */
+export function pickCoreFields(fields: TargetField[]): TargetField[] {
+  const core = fields.filter((f) =>
+    CORE_FIELD_HINTS.some((h) => f.name.toLowerCase().includes(h.toLowerCase()))
+  );
+  return core.length >= 2 ? core : fields;
+}
+
 /** 模型下拉框显示名：给实测结论加标注 */
 export function modelLabel(m: string): string {
   if (m === 'deepseek-ai/DeepSeek-V4-Flash') return `${m}（实测最快·推荐）`;
