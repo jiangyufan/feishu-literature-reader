@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.7 修复缓存部分命中：旧快速模式缓存只有少数字段导致全字段提不出来，现自动补提缺失字段并合并'
+msg = 'deploy: v6.8 仅补提空字段(逐记录只提空/无效字段,已生成不重提) + 拒答话术过滤(很抱歉/无法访问) + 无效值精读重试'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 

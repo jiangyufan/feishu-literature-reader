@@ -137,6 +137,9 @@ export function isEmptyValue(v: string): boolean {
     '未提供', '未给出', '未说明', '未明确', '未提及', '未涉及', '未找到', '未包含',
     '文中未', '文献未', '文献中未', '无法提取', '无法判断', '无法从文献', '没有提供',
     '没有提到', '未见', '缺少相关', '不包含', 'not mentioned in', 'not found in', 'not specified',
+    // AI 拒答/客套话（如“很抱歉，我无法访问互联网或搜索引擎…”），绝不写入表格
+    '很抱歉', '抱歉，我', '无法访问互联网', '无法访问网络', '无法联网',
+    '作为ai', '作为一个ai', 'i cannot', "i can't", 'i apologize', 'as an ai', 'cannot access the internet',
   ];
   return refusals.some((r) => s.includes(r));
 }

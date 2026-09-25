@@ -25,6 +25,8 @@ type RecState = {
   successCount?: number;
   failCount?: number;
   failedFields?: string[];
+  // “仅补提空字段”模式下，本记录实际要提取的字段子集（预扫算好）
+  onlyFields?: TargetField[];
 };
 
 const LS_KEY = 'literature_reader_cfg';
@@ -81,8 +83,9 @@ async function writeFields(
       if (isDescriptionEcho(v, tf.description)) { echoCount += 1; continue; }
       if (onlyEmpty) {
         const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
-        const curStr = Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '');
-        if (curStr.trim()) { existingCount += 1; continue; }
+        const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
+        // 已有“有效内容”才跳过；“无 / 很抱歉… / 模板残留”等无效值视为空，允许覆盖
+        if (curStr && !isEmptyValue(curStr) && !isTemplateResidue(curStr)) { existingCount += 1; continue; }
       }
       await table.setCellValue(tf.fieldId, job.recordId, v.trim());
       successCount += 1;
@@ -194,7 +197,7 @@ export default function App() {
     opts: {
       write: boolean; useCache: boolean; forceRefresh: boolean;
       effectiveFields: TargetField[]; extractMode: ExtractMode; parseLimit: number;
-      onlyEmpty: boolean; provider: ProviderId; apiKey: string; model: string;
+      onlyEmpty: boolean; onlyFields?: TargetField[]; provider: ProviderId; apiKey: string; model: string;
     }
   ) => {
     const setState = (patch: Partial<RecState>) =>
@@ -250,8 +253,23 @@ export default function App() {
         setState({ status: 'error', message: `PDF 解析文本质量异常，已停止。${quality.reason}` });
         return;
       }
-      const extractList = partialMissing ?? opts.effectiveFields;
-      setState({ status: 'generating', message: `${partialCached ? `缓存补提缺失 ${extractList.length} 字段 · ` : ''}AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符 / ${extractList.length} 字段${truncated ? '，已截断' : ''}）` });
+      // 本次实际要提取的字段 =（缓存缺失 ∪ 全量）∩（仅补提模式的空字段子集）
+      let extractList = partialMissing ?? opts.effectiveFields;
+      if (opts.onlyFields?.length) {
+        const allow = new Set(opts.onlyFields.map((f) => f.fieldId));
+        extractList = extractList.filter((f) => allow.has(f.fieldId));
+      }
+      if (!extractList.length) {
+        // 缓存与表格已有内容已覆盖本次要提的字段 → 直接写回收尾
+        if (opts.write) {
+          const w = await writeFields(table, job, partialCached ?? {}, opts.effectiveFields, opts.onlyEmpty);
+          setState({ status: 'done', message: `无缺失字段，写入 ${w.successCount}/${opts.effectiveFields.length}`, successCount: w.successCount });
+        } else {
+          setState({ status: 'done', message: '无缺失字段', successCount: 0 });
+        }
+        return;
+      }
+      setState({ status: 'generating', message: `${partialCached ? `缓存补提缺失 ${extractList.length} 字段 · ` : `本次提取 ${extractList.length} 字段 · `}AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符${truncated ? '，已截断' : ''}）` });
       const startedAt = Date.now();
       let segInfo = '';
       const timer = setInterval(() => {
@@ -262,7 +280,27 @@ export default function App() {
       try {
         extractResult = await extractFieldsAuto(text, extractList, { provider: opts.provider, apiKey: opts.apiKey, model: opts.model }, ac.signal, opts.extractMode, (i, n) => { segInfo = `第 ${i}/${n} 段`; });
       } finally { clearInterval(timer); }
-      const { fields, raws } = extractResult;
+      const fields = extractResult.fields;
+      let raws = extractResult.raws;
+      // 精读重试：AI 返回无效值（无/拒答/占位符）的字段，改用精读模式（单字段+全文+该字段自己的提示词）再试一次
+      const invalidKeys = new Set(Object.entries(fields)
+        .filter(([, v]) => { const s = typeof v === 'string' ? v : String(v); return !s.trim() || isEmptyValue(s) || isTemplateResidue(s); })
+        .map(([k]) => k.trim().toLowerCase()));
+      const retryFields = extractList.filter((f) => invalidKeys.has(f.name.trim().toLowerCase())).slice(0, 8);
+      if (retryFields.length) {
+        setState({ status: 'generating', message: `${retryFields.length} 个字段首次未提出（${retryFields.map((f) => f.name).join('、')}），精读重试中…` });
+        try {
+          const r2 = await extractFieldsAuto(text, retryFields, { provider: opts.provider, apiKey: opts.apiKey, model: opts.model }, ac.signal, 'single');
+          raws = [...raws, ...r2.raws];
+          for (const [k, v] of Object.entries(r2.fields)) {
+            const s = (typeof v === 'string' ? v : String(v)).trim();
+            if (s && !isEmptyValue(s) && !isTemplateResidue(s)) {
+              const orig = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === k.trim().toLowerCase());
+              if (orig) fields[orig] = s; else fields[k] = s;
+            }
+          }
+        } catch { /* 重试失败不影响主结果 */ }
+      }
       // 与旧缓存合并（新结果优先），缓存始终保存“目前已知最全”的字段集
       const mergedFields: Record<string, string> = { ...(partialCached ?? {}), ...fields };
       const elapsed = Math.round((Date.now() - startedAt) / 1000);
@@ -304,19 +342,29 @@ export default function App() {
     try {
       const table = await bitable.base.getTableById(tableId);
       const recordIds = await table.getRecordIdList();
-      // 预扫：已提取过的行整行跳过（只统计本次实际要提取的字段；强制重新提取时不跳过）
+      // 预扫：
+      // - 勾选“仅补提空字段”→ 逐记录找出空/无效字段，只提取这些（不再整行跳过）
+      // - 未勾选（全量重提）→ 旧的整行跳过逻辑（skipThreshold）
       const prescan = await Promise.all(recordIds.map(async (rid) => {
         const rec = await table.getRecordById(rid);
         const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
-        if (!atts?.[0]?.token) return { filled: 0, extracted: false };
-        if (!effOnlyEmpty || skipThreshold === 0) return { filled: 0, extracted: false };
+        if (!atts?.[0]?.token) return { filled: 0, extracted: false, emptyFields: [] as TargetField[] };
+        if (effOnlyEmpty) {
+          const emptyFields = effectiveFields.filter((tf) => {
+            const cur = (rec.fields as any)[tf.fieldId];
+            const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
+            return !curStr || isEmptyValue(curStr) || isTemplateResidue(curStr);
+          });
+          return { filled: effectiveFields.length - emptyFields.length, extracted: emptyFields.length === 0, emptyFields };
+        }
+        if (skipThreshold === 0) return { filled: 0, extracted: false, emptyFields: [] as TargetField[] };
         let filled = 0;
         for (const tf of effectiveFields) {
           const cur = (rec.fields as any)[tf.fieldId];
           const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
           if (curStr && !isEmptyValue(curStr) && !isTemplateResidue(curStr)) filled += 1;
         }
-        return { filled, extracted: filled >= skipThreshold };
+        return { filled, extracted: filled >= skipThreshold, emptyFields: [] as TargetField[] };
       }));
       const jobs: RecState[] = [];
       for (let i = 0; i < recordIds.length; i++) {
@@ -324,9 +372,9 @@ export default function App() {
         const first = (rec.fields as any)[attachFieldId]?.[0];
         if (!first?.token) continue;
         if (prescan[i].extracted) {
-          jobs.push({ recordId: recordIds[i], name: first.name || '未命名附件', status: 'skipped', message: `已提取过（${prescan[i].filled}/${effectiveFields.length} 个字段已有内容），跳过`, skipped: true });
+          jobs.push({ recordId: recordIds[i], name: first.name || '未命名附件', status: 'skipped', message: effOnlyEmpty ? `全部 ${effectiveFields.length} 个字段已有有效内容，跳过` : `已提取过（${prescan[i].filled}/${effectiveFields.length} 个字段已有内容），跳过`, skipped: true });
         } else {
-          jobs.push({ recordId: recordIds[i], name: first.name || '未命名附件', token: first.token, status: 'pending', message: '' });
+          jobs.push({ recordId: recordIds[i], name: first.name || '未命名附件', token: first.token, status: 'pending', message: '', onlyFields: effOnlyEmpty ? prescan[i].emptyFields : undefined });
         }
       }
       setRecs(jobs);
@@ -334,7 +382,7 @@ export default function App() {
       for (const job of jobs) {
         if (ac.signal.aborted) break;
         if (job.skipped) continue;
-        await processJob(job, table, ac, { write: true, useCache: true, forceRefresh, effectiveFields, extractMode, parseLimit, onlyEmpty: effOnlyEmpty, provider, apiKey, model });
+        await processJob(job, table, ac, { write: true, useCache: true, forceRefresh, effectiveFields, extractMode, parseLimit, onlyEmpty: effOnlyEmpty, onlyFields: job.onlyFields, provider, apiKey, model });
       }
     } catch (e: any) {
       Toast.error({ content: `执行出错：${String(e?.message || e)}` });
@@ -499,7 +547,7 @@ export default function App() {
           />
         </Form.Slot>
         <Checkbox checked={onlyEmpty} onChange={(e) => setOnlyEmpty((e.target as any).checked)}>
-          仅填充空字段（已有内容的字段不覆盖）
+          仅补提空字段（只提取表里空/无效的字段，已生成的不重提不覆盖；“无”“很抱歉…”等无效值会自动重提覆盖）
         </Checkbox>
         <Checkbox checked={forceRefresh} onChange={(e) => setForceRefresh((e.target as any).checked)}>
           强制重新提取（重新调 AI 全部再提一遍：忽略本地缓存 + 覆盖已有内容）
