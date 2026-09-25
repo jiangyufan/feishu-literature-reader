@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isEmptyValue, isTemplateResidue, isDescriptionEcho, modelLabel, pickCoreFields } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isEmptyValue, isTemplateResidue, isDescriptionEcho, modelLabel } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -116,8 +116,6 @@ export default function App() {
   const [onlyEmpty, setOnlyEmpty] = useState(true);
   // 已提取判定阈值：有内容的目标字段数 ≥ 阈值即视为"已提取过"，批量时整行跳过；0 = 不跳过
   const [skipThreshold, setSkipThreshold] = useState<number>(1);
-  // 快速模式：只提取核心字段（约 10 个），输出 token 砍到 1/3，实测 ~8-10s
-  const [quickMode, setQuickMode] = useState(false);
   // 强制重新提取：忽略本地缓存（用于覆盖错误结果）
   const [forceRefresh, setForceRefresh] = useState(false);
   // 后台预提取进行中（只缓存不写字段）
@@ -276,7 +274,7 @@ export default function App() {
   const run = useCallback(async () => {
     if (!tableId || !attachFieldId) { Toast.warning({ content: '请先选择数据表和附件字段' }); return; }
     if (!apiKey) { Toast.warning({ content: `请填写 ${PROVIDERS[provider].label} API Key` }); return; }
-    const effectiveFields = quickMode ? pickCoreFields(targetFields) : targetFields;
+    const effectiveFields = targetFields;
     if (!effectiveFields.length) { Toast.warning({ content: '当前表没有可提取的文本字段（请先建好带提示词的文本字段）' }); return; }
     // 强制重新提取 = 忽略缓存 + 覆盖已有内容（否则“仅填充空字段”会拦住写入，让人误以为没重新提取）
     const effOnlyEmpty = onlyEmpty && !forceRefresh;
@@ -324,12 +322,12 @@ export default function App() {
     } finally {
       setRunning(false);
     }
-  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode, parseLimit, skipThreshold, quickMode, forceRefresh, processJob]);
+  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode, parseLimit, skipThreshold, forceRefresh, processJob]);
 
   const runPreExtract = useCallback(async () => {
     if (!tableId || !attachFieldId) { Toast.warning({ content: '请先选择数据表和附件字段' }); return; }
     if (!apiKey) { Toast.warning({ content: `请填写 ${PROVIDERS[provider].label} API Key` }); return; }
-    const effectiveFields = quickMode ? pickCoreFields(targetFields) : targetFields;
+    const effectiveFields = targetFields;
     if (!effectiveFields.length) { Toast.warning({ content: '当前表没有可提取的文本字段' }); return; }
     saveCfg(provider, apiKey, model, onlyEmpty);
     setPrerunning(true);
@@ -356,7 +354,7 @@ export default function App() {
     } finally {
       setPrerunning(false);
     }
-  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode, parseLimit, quickMode, processJob]);
+  }, [tableId, attachFieldId, apiKey, model, onlyEmpty, targetFields, extractMode, parseLimit, processJob]);
 
 
   const doneCount = recs.filter((r) => r.status === 'done').length;
@@ -462,9 +460,9 @@ export default function App() {
             onChange={(v) => setExtractMode(v as ExtractMode)}
             style={{ width: '100%' }}
             optionList={[
-              { label: '全部字段一次提取（推荐·实测最快，14.7万字符约 30 秒）', value: 'all' },
-              { label: '每批 7 个字段（均衡，慢约 4 倍）', value: 'chunk' },
-              { label: '单字段逐个提取（最准，最慢、费额度）', value: 'single' },
+              { label: '快速模式（全部字段一次提取·最快≈30秒·推荐）', value: 'all' },
+              { label: '分批模式（每批 7 个字段·均衡）', value: 'chunk' },
+              { label: '精读模式（逐字段精读·最准最慢）', value: 'single' },
             ]}
           />
         </Form.Slot>
@@ -483,9 +481,6 @@ export default function App() {
         </Form.Slot>
         <Checkbox checked={onlyEmpty} onChange={(e) => setOnlyEmpty((e.target as any).checked)}>
           仅填充空字段（已有内容的字段不覆盖）
-        </Checkbox>
-        <Checkbox checked={quickMode} onChange={(e) => setQuickMode((e.target as any).checked)}>
-          快速模式（只提取 标题/作者/年份/摘要/结论 等核心字段，更快更省；不勾 = 提取全部字段）
         </Checkbox>
         <Checkbox checked={forceRefresh} onChange={(e) => setForceRefresh((e.target as any).checked)}>
           强制重新提取（重新调 AI 全部再提一遍：忽略本地缓存 + 覆盖已有内容）
@@ -507,9 +502,9 @@ export default function App() {
       </Form>
 
       {targetFields.length > 0 && (
-        <Collapsible title={`将提取 ${quickMode ? pickCoreFields(targetFields).length : targetFields.length} 个字段${quickMode ? '（快速模式·核心字段子集）' : ''}`} style={{ margin: '6px 0' }}>
+        <Collapsible title={`将提取全部 ${targetFields.length} 个字段（${extractMode === 'all' ? '快速模式' : extractMode === 'chunk' ? '分批模式' : '精读模式'}）`} style={{ margin: '6px 0' }}>
           <ul style={{ margin: 4, paddingLeft: 18, maxHeight: 180, overflowY: 'auto', color: '#555' }}>
-            {(quickMode ? pickCoreFields(targetFields) : targetFields).map((f) => (
+            {targetFields.map((f) => (
               <li key={f.fieldId}>
                 <b>{f.name}</b>
                 {f.description ? ` — ${f.description}` : '（无描述，按字段名提取）'}

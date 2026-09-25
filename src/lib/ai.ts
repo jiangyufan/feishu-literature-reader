@@ -113,26 +113,9 @@ export const PROVIDERS: Record<ProviderId, ProviderConfig> = {
 };
 
 /**
- * 快速模式核心字段：只提取这些“高频、信息密度高”的字段。
- * 匹配方式：目标字段名包含下面任一关键词即入选（不区分大小写）。
- * 目的：把 28 字段的输出 token 砍到约 1/3，实测提取耗时从 ~23s 降到 ~8-10s。
+ * 模型下拉框显示名：给实测结论加标注
  */
-export const CORE_FIELD_HINTS = [
-  '作者', '年份', '标题', '摘要', '结论', '方法', '创新', '关键词', '学科', '优先级',
-  '期刊', '出版社', '研究目的', '一句话', '研究背景',
-];
-
-/** 从全部目标字段中挑出“核心字段”子集；若匹配不足 2 个则回退到全部（避免空提取） */
-export function pickCoreFields(fields: TargetField[]): TargetField[] {
-  const core = fields.filter((f) =>
-    CORE_FIELD_HINTS.some((h) => f.name.toLowerCase().includes(h.toLowerCase()))
-  );
-  return core.length >= 2 ? core : fields;
-}
-
-/** 模型下拉框显示名：给实测结论加标注 */
-export function modelLabel(m: string): string {
-  if (m === 'deepseek-ai/DeepSeek-V4-Flash') return `${m}（实测最快·推荐）`;
+export function modelLabel(m: string): string {  if (m === 'deepseek-ai/DeepSeek-V4-Flash') return `${m}（实测最快·推荐）`;
   // 所有 Kimi K2/K3 系模型实测解码慢（单批 14.7万字符约 3 分钟），一律标注
   if (/kimi/i.test(m)) return `${m}（实测慢·约 3 分钟/批，建议用硅基流动 + DeepSeek-V4-Flash）`;
   return m;
@@ -247,14 +230,24 @@ export function parseFieldsJson(raw: string): Record<string, string> {
   }
 }
 
-/** 调用单次 chat/completions 提取一批字段 */
+/** 调用单次 chat/completions 提取一批字段
+ * @param deep 精读模式：只提一个字段时，要求模型认真通读全文、严格按该字段提示词提取 */
 async function callOnce(
   text: string,
   fields: TargetField[],
   cfg: AiConfig,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  deep = false
 ): Promise<{ fields: Record<string, string>; usage: any; raw: string }> {
-  const { system, user } = buildPrompt(text, fields);
+  let system: string, user: string;
+  if (deep && fields.length === 1) {
+    const f = fields[0];
+    const desc = sanitizeDescription(f.description, f.name);
+    system = `你是一位严谨的学术文献阅读助手。下面是一份文献经解析得到的全文文本（共 ${text.length} 个字符，可能有解析噪声）。请先认真通读整篇文献，再提取指定的这一个字段，严禁编造文本中没有的信息。`;
+    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。\n\n【文献全文】\n${text}`;
+  } else {
+    ({ system, user } = buildPrompt(text, fields));
+  }
   const provider = PROVIDERS[cfg.provider];
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -281,6 +274,11 @@ async function callOnce(
   }
   const data = await res.json();
   const content = data?.choices?.[0]?.message?.content ?? '';
+  if (deep) {
+    // 精读模式：模型按指令直接输出该字段的值（纯文本），不包 JSON
+    const v = content.trim();
+    return { fields: { [fields[0].name]: v }, usage: data?.usage, raw: v };
+  }
   const fieldsResult = parseFieldsJson(content);
   if (fieldsResult._error) throw new Error(fieldsResult._error);
   return { fields: fieldsResult, usage: data?.usage, raw: content };
@@ -301,6 +299,7 @@ export async function extractFields(
   mode: ExtractMode = 'chunk'
 ): Promise<{ fields: Record<string, string>; usage: any; raws: string[] }> {
   const CHUNK = mode === 'all' ? fields.length : mode === 'single' ? 1 : 7;
+  const deep = mode === 'single';
   const chunks: TargetField[][] = [];
   for (let i = 0; i < fields.length; i += CHUNK) {
     chunks.push(fields.slice(i, i + CHUNK));
@@ -316,7 +315,7 @@ export async function extractFields(
   const runChunk = async (chunk: TargetField[]): Promise<boolean> => {
     for (let attempt = 0; attempt <= 2; attempt++) {
       try {
-        const r = await callOnce(text, chunk, cfg, signal);
+        const r = await callOnce(text, chunk, cfg, signal, deep);
         Object.assign(merged, r.fields);
         usage = r.usage;
         raws.push(`【批次：${chunk.map((f) => f.name).join('、')}】\n${r.raw}`);

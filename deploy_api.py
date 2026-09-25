@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.5 修复快速模式/强制重提语义：预扫按实际字段集、强制重提=忽略缓存+覆盖写入'
+msg = 'deploy: v6.6 模式重做：快速=全部字段一次提取；新增精读模式(逐字段精读,按各自提示词)；删除削减字段的旧快速模式勾选框'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 
