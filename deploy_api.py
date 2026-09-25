@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.13 writeFields 新增残留清理——本次提取判定无效的字段，若表格里留着旧一轮(旧版插件)写入的拒答话术/编造链接/元数据罗列/引文串，自动清空该单元格'
+msg = 'deploy: v6.13.1 补充编造话术变体黑名单(无法直接访问互联网进行实时搜索/建议直接访问相关的学术数据库等9条)+标题字段中英文方向规则(字段名含中文必须翻译/含英文保留原文)'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 
