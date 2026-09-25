@@ -200,21 +200,37 @@ export default function App() {
     const setState = (patch: Partial<RecState>) =>
       setRecs((prev) => prev.map((r) => (r.recordId === job.recordId ? { ...r, ...patch } : r)));
     const key = cacheKey(job.recordId, job.token);
-    // 1) 缓存命中 → 秒出（或仅标记已缓存）
+    // 缓存值有效性：非空、非模板残留、非描述回声
+    const cachedValid = (v: string | undefined, desc: string) => {
+      if (!v || !v.trim() || isEmptyValue(v) || isTemplateResidue(v)) return false;
+      return !isDescriptionEcho(v, desc);
+    };
+    // 1) 缓存命中 → 完整命中秒出；部分命中（如旧版快速模式只缓存了核心字段）→ 只补提缺失字段
+    let partialCached: Record<string, string> | null = null;
+    let partialMissing: TargetField[] | null = null;
     if (opts.useCache && !opts.forceRefresh) {
       const cached = getCache(key);
       if (cached) {
-        if (opts.write) {
-          const w = await writeFields(table, job, cached, opts.effectiveFields, opts.onlyEmpty);
-          const parts = [`写入 ${w.successCount}/${opts.effectiveFields.length}`];
-          if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
-          if (w.existingCount) parts.push(`已有跳过 ${w.existingCount}`);
-          if (w.failCount) parts.push(`失败 ${w.failCount}`);
-          setState({ status: 'done', message: `缓存秒出 · ${parts.join('，')}`, successCount: w.successCount, failCount: w.failCount });
-        } else {
-          setState({ status: 'done', message: '已缓存（点“开始批量提取”即可秒出）', successCount: opts.effectiveFields.length });
+        const missing = opts.effectiveFields.filter((f) => {
+          const k = Object.keys(cached).find((ck) => ck.trim().toLowerCase() === f.name.trim().toLowerCase());
+          return !cachedValid(k ? cached[k] : undefined, f.description);
+        });
+        if (missing.length === 0) {
+          if (opts.write) {
+            const w = await writeFields(table, job, cached, opts.effectiveFields, opts.onlyEmpty);
+            const parts = [`写入 ${w.successCount}/${opts.effectiveFields.length}`];
+            if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
+            if (w.existingCount) parts.push(`已有跳过 ${w.existingCount}`);
+            if (w.failCount) parts.push(`失败 ${w.failCount}`);
+            setState({ status: 'done', message: `缓存秒出 · ${parts.join('，')}`, successCount: w.successCount, failCount: w.failCount });
+          } else {
+            setState({ status: 'done', message: '已缓存（点“开始批量提取”即可秒出）', successCount: opts.effectiveFields.length });
+          }
+          return;
         }
-        return;
+        // 部分命中：记住旧缓存，稍后只补提缺失字段
+        partialCached = cached;
+        partialMissing = missing;
       }
     }
     // 2) 全量流水线
@@ -234,7 +250,8 @@ export default function App() {
         setState({ status: 'error', message: `PDF 解析文本质量异常，已停止。${quality.reason}` });
         return;
       }
-      setState({ status: 'generating', message: `AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符 / ${opts.effectiveFields.length} 字段${truncated ? '，已截断' : ''}）` });
+      const extractList = partialMissing ?? opts.effectiveFields;
+      setState({ status: 'generating', message: `${partialCached ? `缓存补提缺失 ${extractList.length} 字段 · ` : ''}AI 生成中（${pages} 页 / ${text.length.toLocaleString()} 字符 / ${extractList.length} 字段${truncated ? '，已截断' : ''}）` });
       const startedAt = Date.now();
       let segInfo = '';
       const timer = setInterval(() => {
@@ -243,9 +260,11 @@ export default function App() {
       }, 3000);
       let extractResult: { fields: Record<string, string>; raws: string[] };
       try {
-        extractResult = await extractFieldsAuto(text, opts.effectiveFields, { provider: opts.provider, apiKey: opts.apiKey, model: opts.model }, ac.signal, opts.extractMode, (i, n) => { segInfo = `第 ${i}/${n} 段`; });
+        extractResult = await extractFieldsAuto(text, extractList, { provider: opts.provider, apiKey: opts.apiKey, model: opts.model }, ac.signal, opts.extractMode, (i, n) => { segInfo = `第 ${i}/${n} 段`; });
       } finally { clearInterval(timer); }
       const { fields, raws } = extractResult;
+      // 与旧缓存合并（新结果优先），缓存始终保存“目前已知最全”的字段集
+      const mergedFields: Record<string, string> = { ...(partialCached ?? {}), ...fields };
       const elapsed = Math.round((Date.now() - startedAt) / 1000);
       const elapsedStr = elapsed >= 60 ? `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒` : `${elapsed} 秒`;
       setAiReturnPreview(
@@ -253,17 +272,17 @@ export default function App() {
         '===== 解析后的字段值 =====\n' +
         Object.entries(fields).map(([k, v]) => `${k} = ${(typeof v === 'string' ? v : String(v)).slice(0, 30)}${(typeof v === 'string' ? v : String(v)).length > 30 ? '…' : ''}`).join('\n')
       );
-      setCache(key, fields);
+      setCache(key, mergedFields);
       if (opts.write) {
-        const w = await writeFields(table, job, fields, opts.effectiveFields, opts.onlyEmpty);
-        const parts = [`写入 ${w.successCount}/${opts.effectiveFields.length}`];
+        const w = await writeFields(table, job, mergedFields, opts.effectiveFields, opts.onlyEmpty);
+        const parts = [`${partialCached ? '缓存补提后写入' : '写入'} ${w.successCount}/${opts.effectiveFields.length}`];
         if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
         if (w.echoCount) parts.push(`过滤回声 ${w.echoCount}`);
         if (w.existingCount) parts.push(`已有跳过 ${w.existingCount}`);
         if (w.failCount) parts.push(`失败 ${w.failCount}：${w.failedFields.join('、')}`);
         setState({ status: 'done', message: `${parts.join('，')}，耗时 ${elapsedStr}`, successCount: w.successCount, failCount: w.failCount });
       } else {
-        setState({ status: 'done', message: `已缓存 · 提取 ${Object.keys(fields).length} 字段，耗时 ${elapsedStr}`, successCount: Object.keys(fields).length });
+        setState({ status: 'done', message: `已缓存 · 共 ${Object.keys(mergedFields).length} 字段（本次新提 ${Object.keys(fields).length}），耗时 ${elapsedStr}`, successCount: Object.keys(mergedFields).length });
       }
     } catch (e: any) {
       if (e?.name === 'AbortError') { setState({ status: 'error', message: '已停止' }); return; }
