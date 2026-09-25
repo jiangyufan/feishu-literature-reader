@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, normalizeSpecialFieldValue, modelLabel } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, isTitleField, normalizeSpecialFieldValue, modelLabel } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -290,14 +290,17 @@ export default function App() {
         const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === tf.name.trim().toLowerCase());
         if (k) fields[k] = normalizeSpecialFieldValue(tf.name, typeof fields[k] === 'string' ? fields[k] : String(fields[k] ?? ''));
       }
-      // 精读重试：AI 返回无效值（未提及/拒答/占位符；注意"无"对英文标题是合法终值不算）的字段，改用精读模式（单字段+全文+该字段自己的提示词）再试一次
-      const invalidKeys = new Set(extractList
-        .filter((f) => {
-          const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === f.name.trim().toLowerCase());
-          return !isFieldValueValid(f.name, k ? fields[k] : undefined, f.description);
-        })
-        .map((f) => f.name.trim().toLowerCase()));
-      const retryFields = extractList.filter((f) => invalidKeys.has(f.name.trim().toLowerCase())).slice(0, 8);
+      // 精读重试：AI 返回无效值（未提及/拒答/占位符/引文串）的字段，改用精读模式（单字段+全文+该字段自己的提示词）再试一次。
+      // 标题类字段返回"无"也要重试确认一次（防止把有标题的文献误判为无标题）；确认后仍是"无"才接受为终值。
+      const needsRetry = (f: TargetField): boolean => {
+        const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === f.name.trim().toLowerCase());
+        const v = k ? fields[k] : undefined;
+        const s = v == null ? '' : String(v).trim();
+        if (!isFieldValueValid(f.name, v, f.description)) return true;
+        if (isTitleField(f.name) && s === '无') return true;
+        return false;
+      };
+      const retryFields = extractList.filter(needsRetry).slice(0, 8);
       if (retryFields.length) {
         setState({ status: 'generating', message: `${retryFields.length} 个字段首次未提出（${retryFields.map((f) => f.name).join('、')}），精读重试中…` });
         try {

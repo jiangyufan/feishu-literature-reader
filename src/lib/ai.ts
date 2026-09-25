@@ -190,6 +190,24 @@ export function isEnglishTitleField(fieldName: string): boolean {
   return n.includes('英文标题') || n.includes('英文题名') || /english\s*title|original\s*title/i.test(n);
 }
 
+/** 是否为标题类字段（英文标题/中文标题等）：提取质量要求最高 */
+export function isTitleField(fieldName: string): boolean {
+  const n = (fieldName || '').trim().toLowerCase();
+  return n.includes('标题') || n.includes('题名') || /title/i.test(n);
+}
+
+/** 判断值是否像"引文/出处串"而不是标题（如 "P. Araya et al., Automation in Construction, 175 (2025) 106170"） */
+export function looksLikeCitation(v: string): boolean {
+  const s = (v || '').trim();
+  if (!s) return false;
+  if (/et al\.?/i.test(s)) return true;                      // 含 "et al."
+  if (/,\s*\d+\s*\(\d{4}\)/.test(s)) return true;            // "175 (2025)" 卷(年份)
+  if (/\(\d{4}\)\s*[:：]?\s*\d{4,}/.test(s)) return true;    // "(2025) 106170" 文章号
+  if (/\bdoi\b|10\.\d{4,}\//i.test(s)) return true;          // DOI
+  if (/\bissn\b|\bisbn\b/i.test(s)) return true;             // ISSN/ISBN
+  return false;
+}
+
 /** 特殊字段归一化：英文标题提取结果不含英文字母（纯中文/书名号包中文书名）→ 视为没有英文标题，统一写「无」 */
 export function normalizeSpecialFieldValue(fieldName: string, v: string): string {
   if (isEnglishTitleField(fieldName)) {
@@ -207,6 +225,8 @@ export function isFieldValueValid(fieldName: string, v: string | null | undefine
   const s = v == null ? '' : (typeof v === 'string' ? v : String(v)).trim();
   if (!s) return false;
   if (isEnglishTitleField(fieldName) && s === '无') return true;
+  // 标题类字段返回了引文/出处串（AI 把引用格式当标题）→ 无效
+  if (isTitleField(fieldName) && looksLikeCitation(s)) return false;
   if (isEmptyValue(s) || isTemplateResidue(s)) return false;
   if (description && isDescriptionEcho(s, description)) return false;
   return true;
@@ -237,11 +257,17 @@ function buildPrompt(text: string, fields: TargetField[]): { system: string; use
   const etRule = etFields.length
     ? `\n- ${etFields.map((f) => `「${f.name}」`).join('、')}：如果文献本身没有英文（外文）标题（如纯中文论文、中文书籍），该字段值必须填 "无"，严禁把中文标题或中文书名当作英文标题填入；有英文标题时保留英文原文。`
     : '';
+  // 标题类字段：必须是文献自身的标题，严禁把引文/出处串当标题
+  const titleFields = fields.filter((f) => isTitleField(f.name) && !isEnglishTitleField(f.name));
+  const titleRule = titleFields.length
+    ? `\n- ${titleFields.map((f) => `「${f.name}」`).join('、')}：必须输出文献自身的标题（通常在首页/封面最显眼处），外文文献请翻译成通顺的简体中文；严禁输出引文/出处格式的字符串（含 "et al."、期刊名+卷(年份)+页码、DOI、ISSN 的都不是标题）。`
+    : '';
   return {
     system: `你是一位学术文献阅读助手。下面是一份文献（论文、专著或整本书）经解析得到的全文文本，共 ${text.length} 个字符，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。`,
     user: `请从以下文献全文中提取以下字段的内容，严格输出 JSON（不要任何多余说明、不要 markdown 代码块以外的内容）。\n\n【字段列表】每个条目第一行是字段名（JSON 键名必须严格使用该字段名），第二行是该字段的提取要求：\n${fieldList}\n\n要求：\n- 所有字段值用简体中文填写（英文标题/作者/期刊名等专有名词保留原文）；\n- 若某字段在文中确实无法确定，值填 "未提及"；\n- 严禁全部字段都填 "未提及"，必须先从文本中认真提取；\n- JSON 键名只能是上面【字段列表】里的字段名，不能是描述文本；\n- 字段值中严禁出现任何 [xxx]、「……」、「...」等占位符或模板残留；
 - 如果某个字段在文献中确实只有概括性描述、没有具体实质内容，请直接填 "未提及"，不要 Echo 原始描述。
-- 空值只能填 "未提及" 这一个词，严禁自己编造"未提供文献全文""无作者信息""文中未找到"之类的说明性文字作为字段值。${etRule}
+- 空值只能填 "未提及" 这一个词，严禁自己编造"未提供文献全文""无作者信息""文中未找到"之类的说明性文字作为字段值。
+- 内容要具体、有信息量：写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；字段要求里有字数上限的，在上限内尽量写充实。${etRule}${titleRule}
 
 【文献全文】
 ${text}`,
@@ -283,7 +309,11 @@ async function callOnce(
     const etRule = isEnglishTitleField(f.name)
       ? `\n- 特别规则：如果该文献本身没有英文（外文）标题（如纯中文论文、中文书籍），只填 "无" 一个词，严禁把中文标题或中文书名当作英文标题；有英文标题时保留英文原文。`
       : '';
-    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。${etRule}\n\n【文献全文】\n${text}`;
+    // 标题类字段：只输出标题本身，严禁引文/出处串
+    const titleRule = isTitleField(f.name) && !isEnglishTitleField(f.name)
+      ? `\n- 特别规则：只输出文献自身的标题本身（通常在首页/封面最显眼处），外文文献翻译成通顺简体中文；严禁输出引文/出处格式（含 "et al."、期刊名+卷(年份)+页码、DOI、ISSN 的都不是标题），也不要带作者、出版信息。`
+      : '';
+    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 内容要具体、有信息量，写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。${etRule}${titleRule}\n\n【文献全文】\n${text}`;
   } else {
     ({ system, user } = buildPrompt(text, fields));
   }
