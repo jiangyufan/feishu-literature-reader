@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, isTitleField, normalizeSpecialFieldValue, modelLabel } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, isTitleField, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -49,19 +49,23 @@ function descToText(d: any): string {
 function cacheKey(recordId: string, token?: string): string {
   return CACHE_PREFIX + recordId + ':' + (token || '');
 }
-function getCache(key: string): Record<string, string> | null {
+function getCache(key: string): { fields: Record<string, string>; guardVer: number } | null {
   try {
     const raw = localStorage.getItem(key);
     if (!raw) return null;
     const obj = JSON.parse(raw);
-    return obj?.fields && typeof obj.fields === 'object' ? obj.fields : null;
+    if (obj?.fields && typeof obj.fields === 'object') {
+      // guardVer：标题防呆版本。旧缓存（v6.10 之前写入）没有该字段 → 视为 0（标题"无"未经过防呆确认）
+      return { fields: obj.fields, guardVer: typeof obj.guardVer === 'number' ? obj.guardVer : 0 };
+    }
+    return null;
   } catch {
     return null;
   }
 }
 function setCache(key: string, fields: Record<string, string>) {
   try {
-    localStorage.setItem(key, JSON.stringify({ fields, ts: Date.now() }));
+    localStorage.setItem(key, JSON.stringify({ fields, guardVer: TITLE_GUARD_VER, ts: Date.now() }));
   } catch { /* 配额超限忽略 */ }
 }
 
@@ -71,7 +75,8 @@ async function writeFields(
   job: RecState,
   fields: Record<string, string>,
   effectiveFields: TargetField[],
-  onlyEmpty: boolean
+  onlyEmpty: boolean,
+  titlesTrusted: boolean
 ): Promise<{ successCount: number; failCount: number; emptyCount: number; echoCount: number; existingCount: number; failedFields: string[] }> {
   let successCount = 0, failCount = 0, emptyCount = 0, echoCount = 0, existingCount = 0;
   const failedFields: string[] = [];
@@ -90,8 +95,9 @@ async function writeFields(
       if (onlyEmpty) {
         const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
         const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
-        // 已有"有效内容"才跳过；"无"（英文标题）是合法终值，同样视为已有内容
-        if (isFieldValueValid(tf.name, curStr, tf.description)) { existingCount += 1; continue; }
+        // 已有"有效且可信"的内容才跳过：表格里未经防呆确认的标题"无"/引文串不算 → 允许用重提的正确标题覆盖
+        const curValid = isFieldValueValid(tf.name, curStr, tf.description) && !(titleNeedsRecheck(tf.name, curStr) && !titlesTrusted);
+        if (curValid) { existingCount += 1; continue; }
       }
       await table.setCellValue(tf.fieldId, job.recordId, v.trim());
       successCount += 1;
@@ -215,29 +221,34 @@ export default function App() {
     let partialCached: Record<string, string> | null = null;
     let partialMissing: TargetField[] | null = null;
     if (opts.useCache && !opts.forceRefresh) {
-      const cached = getCache(key);
-      if (cached) {
-        const missing = opts.effectiveFields.filter((f) => {
-          const k = Object.keys(cached).find((ck) => ck.trim().toLowerCase() === f.name.trim().toLowerCase());
-          return !isFieldValueValid(f.name, k ? cached[k] : undefined, f.description);
-        });
-        if (missing.length === 0) {
-          if (opts.write) {
-            const w = await writeFields(table, job, cached, opts.effectiveFields, opts.onlyEmpty);
-            const parts = [`写入 ${w.successCount}/${opts.effectiveFields.length}`];
-            if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
-            if (w.existingCount) parts.push(`已有跳过 ${w.existingCount}`);
-            if (w.failCount) parts.push(`失败 ${w.failCount}`);
-            setState({ status: 'done', message: `缓存秒出 · ${parts.join('，')}`, successCount: w.successCount, failCount: w.failCount });
-          } else {
-            setState({ status: 'done', message: '已缓存（点“开始批量提取”即可秒出）', successCount: opts.effectiveFields.length });
-          }
-          return;
+      const entry = getCache(key);
+      const cached: Record<string, string> = entry?.fields ?? {};
+      // 标题防呆：旧版缓存（guardVer 低于当前）里的标题"无"/引文串可能是 AI 敷衍写入的，未经过精读确认 → 视为缺失，复核一次
+      const titlesTrusted = !!entry && entry.guardVer >= TITLE_GUARD_VER;
+      const missing = opts.effectiveFields.filter((f) => {
+        const k = Object.keys(cached).find((ck) => ck.trim().toLowerCase() === f.name.trim().toLowerCase());
+        const v = k ? cached[k] : undefined;
+        if (!isFieldValueValid(f.name, v, f.description)) return true;
+        if (!titlesTrusted && titleNeedsRecheck(f.name, v)) return true;
+        return false;
+      });
+      // 完整命中：所有字段都有效且可信 → 秒出
+      if (missing.length === 0) {
+        if (opts.write) {
+          const w = await writeFields(table, job, cached, opts.effectiveFields, opts.onlyEmpty, titlesTrusted);
+          const parts = [`写入 ${w.successCount}/${opts.effectiveFields.length}`];
+          if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
+          if (w.existingCount) parts.push(`已有跳过 ${w.existingCount}`);
+          if (w.failCount) parts.push(`失败 ${w.failCount}`);
+          setState({ status: 'done', message: `缓存秒出 · ${parts.join('，')}`, successCount: w.successCount, failCount: w.failCount });
+        } else {
+          setState({ status: 'done', message: '已缓存（点“开始批量提取”即可秒出）', successCount: opts.effectiveFields.length });
         }
-        // 部分命中：记住旧缓存，稍后只补提缺失字段
-        partialCached = cached;
-        partialMissing = missing;
+        return;
       }
+      // 部分命中：记住旧缓存，稍后只补提缺失字段
+      partialCached = cached;
+      partialMissing = missing;
     }
     // 2) 全量流水线
     try {
@@ -265,7 +276,8 @@ export default function App() {
       if (!extractList.length) {
         // 缓存与表格已有内容已覆盖本次要提的字段 → 直接写回收尾
         if (opts.write) {
-          const w = await writeFields(table, job, partialCached ?? {}, opts.effectiveFields, opts.onlyEmpty);
+          const preEntry = getCache(key);
+          const w = await writeFields(table, job, partialCached ?? {}, opts.effectiveFields, opts.onlyEmpty, !!preEntry && preEntry.guardVer >= TITLE_GUARD_VER);
           setState({ status: 'done', message: `无缺失字段，写入 ${w.successCount}/${opts.effectiveFields.length}`, successCount: w.successCount });
         } else {
           setState({ status: 'done', message: '无缺失字段', successCount: 0 });
@@ -326,9 +338,12 @@ export default function App() {
         '===== 解析后的字段值 =====\n' +
         Object.entries(fields).map(([k, v]) => `${k} = ${(typeof v === 'string' ? v : String(v)).slice(0, 30)}${(typeof v === 'string' ? v : String(v)).length > 30 ? '…' : ''}`).join('\n')
       );
+      // 写入信任度必须在 setCache 之前计算：本次刚提取的标题已经过防呆重试确认 → 信任本次提取前的旧缓存状态
+      const preWriteEntry = getCache(key);
+      const titlesTrustedForWrite = !!preWriteEntry && preWriteEntry.guardVer >= TITLE_GUARD_VER;
       setCache(key, mergedFields);
       if (opts.write) {
-        const w = await writeFields(table, job, mergedFields, opts.effectiveFields, opts.onlyEmpty);
+        const w = await writeFields(table, job, mergedFields, opts.effectiveFields, opts.onlyEmpty, titlesTrustedForWrite);
         const parts = [`${partialCached ? '缓存补提后写入' : '写入'} ${w.successCount}/${opts.effectiveFields.length}`];
         if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
         if (w.echoCount) parts.push(`过滤回声 ${w.echoCount}`);
@@ -365,21 +380,24 @@ export default function App() {
         const rec = await table.getRecordById(rid);
         const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
         if (!atts?.[0]?.token) return { filled: 0, extracted: false, emptyFields: [] as TargetField[] };
+        // 标题防呆：该记录缓存缺失/旧版（guardVer 低）时，表格里标题的"无"/引文串未经过防呆确认 → 不算有效，需要复核
+        const entry = getCache(cacheKey(rid, atts[0].token));
+        const titlesTrusted = !!entry && entry.guardVer >= TITLE_GUARD_VER;
+        const valid = (tf: TargetField, curStr: string): boolean => {
+          if (!isFieldValueValid(tf.name, curStr, tf.description)) return false;
+          if (!titlesTrusted && titleNeedsRecheck(tf.name, curStr)) return false;
+          return true;
+        };
+        const cellStr = (v: any): string => (Array.isArray(v) ? v.map((s: any) => s?.text ?? s ?? '').join('') : String(v ?? '')).trim();
         if (effOnlyEmpty) {
-          // 注意："无"（英文标题类字段）是合法终值，不算空字段，避免纯中文文献被反复重提
-          const emptyFields = effectiveFields.filter((tf) => {
-            const cur = (rec.fields as any)[tf.fieldId];
-            const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
-            return !isFieldValueValid(tf.name, curStr, tf.description);
-          });
+          // 注意："无"（英文标题类字段）经防呆确认后是合法终值，不算空字段，避免纯中文文献被反复重提
+          const emptyFields = effectiveFields.filter((tf) => !valid(tf, cellStr((rec.fields as any)[tf.fieldId])));
           return { filled: effectiveFields.length - emptyFields.length, extracted: emptyFields.length === 0, emptyFields };
         }
         if (skipThreshold === 0) return { filled: 0, extracted: false, emptyFields: [] as TargetField[] };
         let filled = 0;
         for (const tf of effectiveFields) {
-          const cur = (rec.fields as any)[tf.fieldId];
-          const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
-          if (isFieldValueValid(tf.name, curStr, tf.description)) filled += 1;
+          if (valid(tf, cellStr((rec.fields as any)[tf.fieldId]))) filled += 1;
         }
         return { filled, extracted: filled >= skipThreshold, emptyFields: [] as TargetField[] };
       }));
@@ -450,7 +468,7 @@ export default function App() {
 
   return (
     <main style={{ padding: 12, fontSize: 13 }}>
-      <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器 <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>v6.9</span></h4>
+      <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器 <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>v6.11</span></h4>
         <Banner
         type="info"
         closeIcon={null}

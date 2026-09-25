@@ -196,6 +196,17 @@ export function isTitleField(fieldName: string): boolean {
   return n.includes('标题') || n.includes('题名') || /title/i.test(n);
 }
 
+/** 标题防呆版本：v2 起标题"无"/引文串必须经过单字段精读确认后才算终值。
+ * 低于此版本的缓存/表格旧数据里的标题"无"不可信（可能是 v6.9 之前 AI 敷衍写入的），需复核一次。 */
+export const TITLE_GUARD_VER = 2;
+
+/** 标题类字段值是否需要复核（"无" 或 引文/出处串）：未经防呆确认前一律视为可疑 */
+export function titleNeedsRecheck(fieldName: string, v: string | null | undefined): boolean {
+  if (!isTitleField(fieldName)) return false;
+  const s = (v == null ? '' : String(v)).trim();
+  return s === '无' || looksLikeCitation(s);
+}
+
 /** 判断值是否像"引文/出处串"而不是标题（如 "P. Araya et al., Automation in Construction, 175 (2025) 106170"） */
 export function looksLikeCitation(v: string): boolean {
   const s = (v || '').trim();
