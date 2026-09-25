@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isEmptyValue, isTemplateResidue, isDescriptionEcho, modelLabel } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, normalizeSpecialFieldValue, modelLabel } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -31,6 +31,8 @@ type RecState = {
 
 const LS_KEY = 'literature_reader_cfg';
 const CACHE_PREFIX = 'litcache:';
+// 配置版本：v6.9（=2）起"仅补提空字段"默认改为不勾选，旧存储只恢复 API 配置、不再恢复旧勾选状态
+const CFG_VER = 2;
 
 /** 把 js-sdk 字段描述（可能为 {content:[{text}]} 或字符串）提取为纯文本提示词 */
 function descToText(d: any): string {
@@ -79,13 +81,17 @@ async function writeFields(
       let v = key ? fields[key] : undefined;
       if (v == null) { emptyCount += 1; continue; }
       v = typeof v === 'string' ? v : String(v);
-      if (!v.trim() || isEmptyValue(v) || isTemplateResidue(v)) { emptyCount += 1; continue; }
+      // 特殊字段归一化（如英文标题：没有英文字母 → 统一写"无"）
+      v = normalizeSpecialFieldValue(tf.name, v);
+      if (!v.trim()) { emptyCount += 1; continue; }
       if (isDescriptionEcho(v, tf.description)) { echoCount += 1; continue; }
+      // "无"（英文标题）等合法终值直接写入；真正无效的值（未提及/拒答/模板残留）不写入
+      if (!isFieldValueValid(tf.name, v)) { emptyCount += 1; continue; }
       if (onlyEmpty) {
         const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
         const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
-        // 已有“有效内容”才跳过；“无 / 很抱歉… / 模板残留”等无效值视为空，允许覆盖
-        if (curStr && !isEmptyValue(curStr) && !isTemplateResidue(curStr)) { existingCount += 1; continue; }
+        // 已有"有效内容"才跳过；"无"（英文标题）是合法终值，同样视为已有内容
+        if (isFieldValueValid(tf.name, curStr, tf.description)) { existingCount += 1; continue; }
       }
       await table.setCellValue(tf.fieldId, job.recordId, v.trim());
       successCount += 1;
@@ -116,7 +122,8 @@ export default function App() {
   const [extractMode, setExtractMode] = useState<ExtractMode>('all');
   // 解析字数上限：越小单次 AI 调用越快、越省额度；0=智能分段（不限字数，自动切段补漏）
   const [parseLimit, setParseLimit] = useState<number>(150000);
-  const [onlyEmpty, setOnlyEmpty] = useState(true);
+  // 仅补提空字段：默认不勾选（正常提取应为全量提取；需要增量补漏时用户自己勾选）
+  const [onlyEmpty, setOnlyEmpty] = useState(false);
   // 已提取判定阈值：有内容的目标字段数 ≥ 阈值即视为"已提取过"，批量时整行跳过；0 = 不跳过
   const [skipThreshold, setSkipThreshold] = useState<number>(1);
   // 强制重新提取：忽略本地缓存（用于覆盖错误结果）
@@ -148,7 +155,8 @@ export default function App() {
         const list = PROVIDERS[saved.provider as ProviderId || provider].models;
         setModel(list.includes(saved.model) ? saved.model : list[0]);
       }
-      if (typeof saved.onlyEmpty === 'boolean') setOnlyEmpty(saved.onlyEmpty);
+      // 旧版本配置（_cfgVer !== CFG_VER）不恢复 onlyEmpty，让它回到默认"不勾选"
+      if (saved._cfgVer === CFG_VER && typeof saved.onlyEmpty === 'boolean') setOnlyEmpty(saved.onlyEmpty);
     } catch { /* ignore */ }
   }, []);
 
@@ -186,7 +194,7 @@ export default function App() {
   };
 
   const saveCfg = (p: ProviderId, k: string, m: string, oe: boolean) => {
-    localStorage.setItem(LS_KEY, JSON.stringify({ provider: p, apiKey: k, model: m, onlyEmpty: oe }));
+    localStorage.setItem(LS_KEY, JSON.stringify({ provider: p, apiKey: k, model: m, onlyEmpty: oe, _cfgVer: CFG_VER }));
   };
 
   // 单条记录处理：缓存命中则秒出；否则 下载→解析→AI提取→（可选）写回→缓存
@@ -203,11 +211,6 @@ export default function App() {
     const setState = (patch: Partial<RecState>) =>
       setRecs((prev) => prev.map((r) => (r.recordId === job.recordId ? { ...r, ...patch } : r)));
     const key = cacheKey(job.recordId, job.token);
-    // 缓存值有效性：非空、非模板残留、非描述回声
-    const cachedValid = (v: string | undefined, desc: string) => {
-      if (!v || !v.trim() || isEmptyValue(v) || isTemplateResidue(v)) return false;
-      return !isDescriptionEcho(v, desc);
-    };
     // 1) 缓存命中 → 完整命中秒出；部分命中（如旧版快速模式只缓存了核心字段）→ 只补提缺失字段
     let partialCached: Record<string, string> | null = null;
     let partialMissing: TargetField[] | null = null;
@@ -216,7 +219,7 @@ export default function App() {
       if (cached) {
         const missing = opts.effectiveFields.filter((f) => {
           const k = Object.keys(cached).find((ck) => ck.trim().toLowerCase() === f.name.trim().toLowerCase());
-          return !cachedValid(k ? cached[k] : undefined, f.description);
+          return !isFieldValueValid(f.name, k ? cached[k] : undefined, f.description);
         });
         if (missing.length === 0) {
           if (opts.write) {
@@ -282,26 +285,36 @@ export default function App() {
       } finally { clearInterval(timer); }
       const fields = extractResult.fields;
       let raws = extractResult.raws;
-      // 精读重试：AI 返回无效值（无/拒答/占位符）的字段，改用精读模式（单字段+全文+该字段自己的提示词）再试一次
-      const invalidKeys = new Set(Object.entries(fields)
-        .filter(([, v]) => { const s = typeof v === 'string' ? v : String(v); return !s.trim() || isEmptyValue(s) || isTemplateResidue(s); })
-        .map(([k]) => k.trim().toLowerCase()));
+      // 特殊字段归一化：英文标题没有英文字母（纯中文/中文书名）→ 统一写"无"
+      for (const tf of extractList) {
+        const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === tf.name.trim().toLowerCase());
+        if (k) fields[k] = normalizeSpecialFieldValue(tf.name, typeof fields[k] === 'string' ? fields[k] : String(fields[k] ?? ''));
+      }
+      // 精读重试：AI 返回无效值（未提及/拒答/占位符；注意"无"对英文标题是合法终值不算）的字段，改用精读模式（单字段+全文+该字段自己的提示词）再试一次
+      const invalidKeys = new Set(extractList
+        .filter((f) => {
+          const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === f.name.trim().toLowerCase());
+          return !isFieldValueValid(f.name, k ? fields[k] : undefined, f.description);
+        })
+        .map((f) => f.name.trim().toLowerCase()));
       const retryFields = extractList.filter((f) => invalidKeys.has(f.name.trim().toLowerCase())).slice(0, 8);
       if (retryFields.length) {
         setState({ status: 'generating', message: `${retryFields.length} 个字段首次未提出（${retryFields.map((f) => f.name).join('、')}），精读重试中…` });
         try {
           const r2 = await extractFieldsAuto(text, retryFields, { provider: opts.provider, apiKey: opts.apiKey, model: opts.model }, ac.signal, 'single');
           raws = [...raws, ...r2.raws];
-          for (const [k, v] of Object.entries(r2.fields)) {
-            const s = (typeof v === 'string' ? v : String(v)).trim();
-            if (s && !isEmptyValue(s) && !isTemplateResidue(s)) {
+          for (const [k, vRaw] of Object.entries(r2.fields)) {
+            const rf = retryFields.find((f) => f.name.trim().toLowerCase() === k.trim().toLowerCase());
+            if (!rf) continue;
+            const s = normalizeSpecialFieldValue(rf.name, (typeof vRaw === 'string' ? vRaw : String(vRaw)).trim());
+            if (isFieldValueValid(rf.name, s, rf.description)) {
               const orig = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === k.trim().toLowerCase());
               if (orig) fields[orig] = s; else fields[k] = s;
             }
           }
         } catch { /* 重试失败不影响主结果 */ }
       }
-      // 与旧缓存合并（新结果优先），缓存始终保存“目前已知最全”的字段集
+      // 与旧缓存合并（新结果优先），缓存始终保存"目前已知最全"的字段集
       const mergedFields: Record<string, string> = { ...(partialCached ?? {}), ...fields };
       const elapsed = Math.round((Date.now() - startedAt) / 1000);
       const elapsedStr = elapsed >= 60 ? `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒` : `${elapsed} 秒`;
@@ -350,10 +363,11 @@ export default function App() {
         const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
         if (!atts?.[0]?.token) return { filled: 0, extracted: false, emptyFields: [] as TargetField[] };
         if (effOnlyEmpty) {
+          // 注意："无"（英文标题类字段）是合法终值，不算空字段，避免纯中文文献被反复重提
           const emptyFields = effectiveFields.filter((tf) => {
             const cur = (rec.fields as any)[tf.fieldId];
             const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
-            return !curStr || isEmptyValue(curStr) || isTemplateResidue(curStr);
+            return !isFieldValueValid(tf.name, curStr, tf.description);
           });
           return { filled: effectiveFields.length - emptyFields.length, extracted: emptyFields.length === 0, emptyFields };
         }
@@ -362,7 +376,7 @@ export default function App() {
         for (const tf of effectiveFields) {
           const cur = (rec.fields as any)[tf.fieldId];
           const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
-          if (curStr && !isEmptyValue(curStr) && !isTemplateResidue(curStr)) filled += 1;
+          if (isFieldValueValid(tf.name, curStr, tf.description)) filled += 1;
         }
         return { filled, extracted: filled >= skipThreshold, emptyFields: [] as TargetField[] };
       }));
@@ -433,7 +447,7 @@ export default function App() {
 
   return (
     <main style={{ padding: 12, fontSize: 13 }}>
-      <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器</h4>
+      <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器 <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>v6.9</span></h4>
         <Banner
         type="info"
         closeIcon={null}

@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.8 仅补提空字段(逐记录只提空/无效字段,已生成不重提) + 拒答话术过滤(很抱歉/无法访问) + 无效值精读重试'
+msg = 'deploy: v6.9 英文标题无英文内容时写无(不再拿中文标题凑数)+视为合法终值不再重提 + 已全提记录显示已提取跳过不报失败 + 仅补提空字段默认不勾选'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 

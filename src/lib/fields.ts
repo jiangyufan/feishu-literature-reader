@@ -6,7 +6,7 @@ export interface ExtractionField {
 
 export const EXTRACTION_FIELDS: ExtractionField[] = [
   { name: '中文标题', hint: '文献的中文标题，外文文献请翻译成中文' },
-  { name: '英文标题', hint: '文献原文标题（保留原文语言）' },
+  { name: '英文标题', hint: '文献的英文（外文）原文标题；纯中文文献/中文书籍没有英文标题时填「无」，严禁把中文标题或中文书名当作英文标题' },
   { name: '作者', hint: '作者姓名，多人用顿号分隔' },
   { name: '发表年份', hint: '出版或发表年份，仅数字' },
   { name: '研究目的', hint: '该文献要解决的核心问题或研究目的，50 字以内' },

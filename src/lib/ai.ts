@@ -184,7 +184,35 @@ export function isDescriptionEcho(value: string, description: string): boolean {
   return false;
 }
 
-/** 清理字段描述中的模板占位符（如“[作者]，发表于[期刊]” / “本文研究...机制”），避免 AI 把占位符原样输出 */
+/** 是否为「英文标题」类字段：纯中文文献没有英文标题，"无"是合法终值 */
+export function isEnglishTitleField(fieldName: string): boolean {
+  const n = (fieldName || '').trim().toLowerCase();
+  return n.includes('英文标题') || n.includes('英文题名') || /english\s*title|original\s*title/i.test(n);
+}
+
+/** 特殊字段归一化：英文标题提取结果不含英文字母（纯中文/书名号包中文书名）→ 视为没有英文标题，统一写「无」 */
+export function normalizeSpecialFieldValue(fieldName: string, v: string): string {
+  if (isEnglishTitleField(fieldName)) {
+    const s = (v || '').trim().replace(/^《+|》+$/g, '').trim();
+    if (!s) return '无';
+    if (s !== '无' && !/[a-zA-Z]/.test(s)) return '无';
+    return s;
+  }
+  return v;
+}
+
+/** 字段值是否为有效终值（可直接写入表格 / 视为"已提取"）。
+ * 注意：「英文标题」的"无"是合法终值（确实没有英文标题），不能再当成空值反复重提。 */
+export function isFieldValueValid(fieldName: string, v: string | null | undefined, description = ''): boolean {
+  const s = v == null ? '' : (typeof v === 'string' ? v : String(v)).trim();
+  if (!s) return false;
+  if (isEnglishTitleField(fieldName) && s === '无') return true;
+  if (isEmptyValue(s) || isTemplateResidue(s)) return false;
+  if (description && isDescriptionEcho(s, description)) return false;
+  return true;
+}
+
+/** 清理字段描述中的模板占位符（如"[作者]，发表于[期刊]" / "本文研究...机制"），避免 AI 把占位符原样输出 */
 function sanitizeDescription(desc: string, fieldName: string): string {
   let s = (desc || '').trim();
   // 删除 [xxx] 占位符
@@ -204,11 +232,16 @@ function buildPrompt(text: string, fields: TargetField[]): { system: string; use
     const desc = sanitizeDescription(f.description, f.name);
     return `${i + 1}. 字段名：${f.name}\n   要求：${desc}`;
   }).join('\n');
+  // 英文标题类字段：纯中文文献没有英文标题，必须填"无"，严禁拿中文标题凑数
+  const etFields = fields.filter((f) => isEnglishTitleField(f.name));
+  const etRule = etFields.length
+    ? `\n- ${etFields.map((f) => `「${f.name}」`).join('、')}：如果文献本身没有英文（外文）标题（如纯中文论文、中文书籍），该字段值必须填 "无"，严禁把中文标题或中文书名当作英文标题填入；有英文标题时保留英文原文。`
+    : '';
   return {
     system: `你是一位学术文献阅读助手。下面是一份文献（论文、专著或整本书）经解析得到的全文文本，共 ${text.length} 个字符，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。`,
     user: `请从以下文献全文中提取以下字段的内容，严格输出 JSON（不要任何多余说明、不要 markdown 代码块以外的内容）。\n\n【字段列表】每个条目第一行是字段名（JSON 键名必须严格使用该字段名），第二行是该字段的提取要求：\n${fieldList}\n\n要求：\n- 所有字段值用简体中文填写（英文标题/作者/期刊名等专有名词保留原文）；\n- 若某字段在文中确实无法确定，值填 "未提及"；\n- 严禁全部字段都填 "未提及"，必须先从文本中认真提取；\n- JSON 键名只能是上面【字段列表】里的字段名，不能是描述文本；\n- 字段值中严禁出现任何 [xxx]、「……」、「...」等占位符或模板残留；
 - 如果某个字段在文献中确实只有概括性描述、没有具体实质内容，请直接填 "未提及"，不要 Echo 原始描述。
-- 空值只能填 "未提及" 这一个词，严禁自己编造"未提供文献全文""无作者信息""文中未找到"之类的说明性文字作为字段值。
+- 空值只能填 "未提及" 这一个词，严禁自己编造"未提供文献全文""无作者信息""文中未找到"之类的说明性文字作为字段值。${etRule}
 
 【文献全文】
 ${text}`,
@@ -247,7 +280,10 @@ async function callOnce(
     const f = fields[0];
     const desc = sanitizeDescription(f.description, f.name);
     system = `你是一位严谨的学术文献阅读助手。下面是一份文献经解析得到的全文文本（共 ${text.length} 个字符，可能有解析噪声）。请先认真通读整篇文献，再提取指定的这一个字段，严禁编造文本中没有的信息。`;
-    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。\n\n【文献全文】\n${text}`;
+    const etRule = isEnglishTitleField(f.name)
+      ? `\n- 特别规则：如果该文献本身没有英文（外文）标题（如纯中文论文、中文书籍），只填 "无" 一个词，严禁把中文标题或中文书名当作英文标题；有英文标题时保留英文原文。`
+      : '';
+    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。${etRule}\n\n【文献全文】\n${text}`;
   } else {
     ({ system, user } = buildPrompt(text, fields));
   }
