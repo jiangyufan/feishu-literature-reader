@@ -278,6 +278,8 @@ export default function App() {
     if (!apiKey) { Toast.warning({ content: `请填写 ${PROVIDERS[provider].label} API Key` }); return; }
     const effectiveFields = quickMode ? pickCoreFields(targetFields) : targetFields;
     if (!effectiveFields.length) { Toast.warning({ content: '当前表没有可提取的文本字段（请先建好带提示词的文本字段）' }); return; }
+    // 强制重新提取 = 忽略缓存 + 覆盖已有内容（否则“仅填充空字段”会拦住写入，让人误以为没重新提取）
+    const effOnlyEmpty = onlyEmpty && !forceRefresh;
     saveCfg(provider, apiKey, model, onlyEmpty);
     setRunning(true);
     const ac = new AbortController();
@@ -285,14 +287,14 @@ export default function App() {
     try {
       const table = await bitable.base.getTableById(tableId);
       const recordIds = await table.getRecordIdList();
-      // 预扫：已提取过的行整行跳过（统计非空目标字段数）
+      // 预扫：已提取过的行整行跳过（只统计本次实际要提取的字段；强制重新提取时不跳过）
       const prescan = await Promise.all(recordIds.map(async (rid) => {
         const rec = await table.getRecordById(rid);
         const atts = (rec.fields as any)[attachFieldId] as any[] | undefined;
         if (!atts?.[0]?.token) return { filled: 0, extracted: false };
-        if (!onlyEmpty || skipThreshold === 0) return { filled: 0, extracted: false };
+        if (!effOnlyEmpty || skipThreshold === 0) return { filled: 0, extracted: false };
         let filled = 0;
-        for (const tf of targetFields) {
+        for (const tf of effectiveFields) {
           const cur = (rec.fields as any)[tf.fieldId];
           const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
           if (curStr && !isEmptyValue(curStr) && !isTemplateResidue(curStr)) filled += 1;
@@ -305,7 +307,7 @@ export default function App() {
         const first = (rec.fields as any)[attachFieldId]?.[0];
         if (!first?.token) continue;
         if (prescan[i].extracted) {
-          jobs.push({ recordId: recordIds[i], name: first.name || '未命名附件', status: 'skipped', message: `已提取过（${prescan[i].filled}/${targetFields.length} 个字段已有内容），跳过`, skipped: true });
+          jobs.push({ recordId: recordIds[i], name: first.name || '未命名附件', status: 'skipped', message: `已提取过（${prescan[i].filled}/${effectiveFields.length} 个字段已有内容），跳过`, skipped: true });
         } else {
           jobs.push({ recordId: recordIds[i], name: first.name || '未命名附件', token: first.token, status: 'pending', message: '' });
         }
@@ -315,7 +317,7 @@ export default function App() {
       for (const job of jobs) {
         if (ac.signal.aborted) break;
         if (job.skipped) continue;
-        await processJob(job, table, ac, { write: true, useCache: true, forceRefresh, effectiveFields, extractMode, parseLimit, onlyEmpty, provider, apiKey, model });
+        await processJob(job, table, ac, { write: true, useCache: true, forceRefresh, effectiveFields, extractMode, parseLimit, onlyEmpty: effOnlyEmpty, provider, apiKey, model });
       }
     } catch (e: any) {
       Toast.error({ content: `执行出错：${String(e?.message || e)}` });
@@ -483,10 +485,10 @@ export default function App() {
           仅填充空字段（已有内容的字段不覆盖）
         </Checkbox>
         <Checkbox checked={quickMode} onChange={(e) => setQuickMode((e.target as any).checked)}>
-          快速模式（仅提取核心字段，输出 token 砍到约 1/3，实测 ~8-10 秒）
+          快速模式（只提取 标题/作者/年份/摘要/结论 等核心字段，更快更省；不勾 = 提取全部字段）
         </Checkbox>
         <Checkbox checked={forceRefresh} onChange={(e) => setForceRefresh((e.target as any).checked)}>
-          强制重新提取（忽略本地缓存，覆盖旧结果）
+          强制重新提取（重新调 AI 全部再提一遍：忽略本地缓存 + 覆盖已有内容）
         </Checkbox>
         <Form.Slot label="已提取判定（批量时整行跳过的条件）">
           <Select
