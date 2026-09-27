@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.13.1 补充编造话术变体黑名单(无法直接访问互联网进行实时搜索/建议直接访问相关的学术数据库等9条)+标题字段中英文方向规则(字段名含中文必须翻译/含英文保留原文)'
+msg = 'deploy: v6.14 网络错误自动重试(Failed to fetch)+跳过阈值默认0+缓存版本作废CACHE_VER=3/只缓存有效值/hasNew有效性判断(根除污染死锁)+拒答正则结构识别+相关文献多条目结构校验+摘要关键词书目特征词校验+标题作者精读首页锚定'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 

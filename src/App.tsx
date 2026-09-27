@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -33,6 +33,11 @@ const LS_KEY = 'literature_reader_cfg';
 const CACHE_PREFIX = 'litcache:';
 // 配置版本：v6.9（=2）起"仅补提空字段"默认改为不勾选，旧存储只恢复 API 配置、不再恢复旧勾选状态
 const CFG_VER = 2;
+// 面板版本号（显示在标题 + 写入每条记录的完成/失败消息，便于从导出截图追溯实际运行的代码版本）
+const APP_VER = 'v6.14';
+// 缓存结构版本：v6.14（=3）起缓存只存有效值；旧结构缓存（无 cacheVer 或版本更低）整体作废，
+// 根除"历史污染值长年留在缓存里 → 写不进（被校验拦）也清不掉（被 hasNew 误判为有值）"的死锁。
+const CACHE_VER = 3;
 
 /** 把 js-sdk 字段描述（可能为 {content:[{text}]} 或字符串）提取为纯文本提示词 */
 function descToText(d: any): string {
@@ -54,6 +59,9 @@ function getCache(key: string): { fields: Record<string, string>; guardVer: numb
     const raw = localStorage.getItem(key);
     if (!raw) return null;
     const obj = JSON.parse(raw);
+    // v6.14：旧结构缓存（无 cacheVer 或版本低于当前）整体作废——历史缓存里可能存着
+    // 拒答话术/元数据罗列等污染值，作废重提比带着污染值跑十轮都可靠
+    if (typeof obj?.cacheVer !== 'number' || obj.cacheVer < CACHE_VER) return null;
     if (obj?.fields && typeof obj.fields === 'object') {
       // guardVer：标题防呆版本。旧缓存（v6.10 之前写入）没有该字段 → 视为 0（标题"无"未经过防呆确认）
       return { fields: obj.fields, guardVer: typeof obj.guardVer === 'number' ? obj.guardVer : 0 };
@@ -65,7 +73,14 @@ function getCache(key: string): { fields: Record<string, string>; guardVer: numb
 }
 function setCache(key: string, fields: Record<string, string>) {
   try {
-    localStorage.setItem(key, JSON.stringify({ fields, guardVer: TITLE_GUARD_VER, ts: Date.now() }));
+    // v6.14：只缓存有效值——拒答话术/元数据罗列/占位符/引文串不进缓存，
+    // 否则它们会让清理循环的 hasNew 误判"本次有值"而跳过擦表（污染死锁的根源）
+    const clean: Record<string, string> = {};
+    for (const [k, raw] of Object.entries(fields || {})) {
+      const s = normalizeSpecialFieldValue(k, String(raw ?? '')).trim();
+      if (s && isFieldValueValid(k, s)) clean[k] = s;
+    }
+    localStorage.setItem(key, JSON.stringify({ fields: clean, guardVer: TITLE_GUARD_VER, cacheVer: CACHE_VER, ts: Date.now() }));
   } catch { /* 配额超限忽略 */ }
 }
 
@@ -112,8 +127,14 @@ async function writeFields(
   for (const tf of effectiveFields) {
     try {
       const key = Object.keys(fields).find((k) => k.trim().toLowerCase() === tf.name.trim().toLowerCase());
-      const hasNew = key != null && fields[key] != null && String(fields[key]).trim() !== '';
-      if (hasNew) continue; // 本次有值已正常写入（或写入被 onlyEmpty 跳过但值合法），无需清理
+      // v6.14：hasNew 必须是"有【有效】值"——缓存里存的拒答话术/元数据罗列虽非空，
+      // 但会被写入校验拦下永远进不了表格；若把它们当"有值"跳过清理，旧垃圾就永远留在单元格里
+      let hasNew = false;
+      if (key != null && fields[key] != null) {
+        const nv = normalizeSpecialFieldValue(tf.name, String(fields[key])).trim();
+        hasNew = nv !== '' && isFieldValueValid(tf.name, nv);
+      }
+      if (hasNew) continue; // 本次有有效值已正常写入，无需清理
       const rec = await table.getRecordById(job.recordId);
       const cur = rec.fields[tf.fieldId];
       const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
@@ -150,7 +171,8 @@ export default function App() {
   // 仅补提空字段：默认不勾选（正常提取应为全量提取；需要增量补漏时用户自己勾选）
   const [onlyEmpty, setOnlyEmpty] = useState(false);
   // 已提取判定阈值：有内容的目标字段数 ≥ 阈值即视为"已提取过"，批量时整行跳过；0 = 不跳过
-  const [skipThreshold, setSkipThreshold] = useState<number>(1);
+  // v6.14 默认改 0：阈值 1 会让"重跑修复"静默跳过已有内容的行（旧垃圾原样留在表里），用户以为跑了其实没跑
+  const [skipThreshold, setSkipThreshold] = useState<number>(0);
   // 强制重新提取：忽略本地缓存（用于覆盖错误结果）
   const [forceRefresh, setForceRefresh] = useState(false);
   // 后台预提取进行中（只缓存不写字段）
@@ -231,6 +253,7 @@ export default function App() {
       write: boolean; useCache: boolean; forceRefresh: boolean;
       effectiveFields: TargetField[]; extractMode: ExtractMode; parseLimit: number;
       onlyEmpty: boolean; onlyFields?: TargetField[]; provider: ProviderId; apiKey: string; model: string;
+      _retried?: boolean; // v6.14：网络错误自动重试标记（防无限重试）
     }
   ) => {
     const setState = (patch: Partial<RecState>) =>
@@ -383,13 +406,21 @@ export default function App() {
         if (w.echoCount) parts.push(`过滤回声 ${w.echoCount}`);
         if (w.existingCount) parts.push(`已有跳过 ${w.existingCount}`);
         if (w.failCount) parts.push(`失败 ${w.failCount}：${w.failedFields.join('、')}`);
-        setState({ status: 'done', message: `${parts.join('，')}，耗时 ${elapsedStr}`, successCount: w.successCount, failCount: w.failCount });
+        setState({ status: 'done', message: `[${APP_VER}] ${parts.join('，')}，耗时 ${elapsedStr}`, successCount: w.successCount, failCount: w.failCount });
       } else {
         setState({ status: 'done', message: `已缓存 · 共 ${Object.keys(mergedFields).length} 字段（本次新提 ${Object.keys(fields).length}），耗时 ${elapsedStr}`, successCount: Object.keys(mergedFields).length });
       }
     } catch (e: any) {
       if (e?.name === 'AbortError') { setState({ status: 'error', message: '已停止' }); return; }
-      setState({ status: 'error', message: String(e?.message || e).slice(0, 500), failCount: opts.effectiveFields.length, failedFields: opts.effectiveFields.map((f) => f.name) });
+      const errMsg = String(e?.message || e);
+      // v6.14：网络层瞬时错误（Failed to fetch 等，附件下载和 AI 调用都可能撞上）自动重试 1 次，
+      // 避免整条记录因一次网络波动全军覆没（实测案例：记录整行 0 字段 + "Failed to fetch"）
+      if (!opts._retried && /failed to fetch|networkerror|load failed|timed?\s*out|network/i.test(errMsg)) {
+        setState({ status: 'pending', message: '网络波动，5 秒后自动重试本条记录…' });
+        setTimeout(() => { processJob(job, table, ac, { ...opts, _retried: true }); }, 5000);
+        return;
+      }
+      setState({ status: 'error', message: `[${APP_VER}] ${errMsg.slice(0, 480)}`, failCount: opts.effectiveFields.length, failedFields: opts.effectiveFields.map((f) => f.name) });
     }
   }, [attachFieldId]);
 
@@ -502,7 +533,7 @@ export default function App() {
 
   return (
     <main style={{ padding: 12, fontSize: 13 }}>
-      <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器 <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>v6.13.1</span></h4>
+      <h4 style={{ margin: '0 0 8px' }}>📚 文献批量阅读器 <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>{APP_VER}</span></h4>
         <Banner
         type="info"
         closeIcon={null}

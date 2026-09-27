@@ -230,7 +230,38 @@ export function looksLikeFabrication(v: string): boolean {
     '无法直接访问互联网和实时数据库', '基于您提供的参考数据', '这些信息是基于您提供的',
     '示例，这些信息', '标题和发表年份的示例', '链接和发表年份的示例', '真实链接和发表年份',
   ];
-  return markers.some((m) => s.toLowerCase().includes(m.toLowerCase()));
+  if (markers.some((m) => s.toLowerCase().includes(m.toLowerCase()))) return true;
+  // v6.14 结构化拒答识别（正则模式而非枚举）：AI 每轮都会换新措辞，枚举永远追不完。
+  // 拒答/操作指引的"结构"是稳定的：道歉+无法联网 / 无法+访问搜索+互联网数据库 / 建议+使用搜索引擎。
+  const lower = s.toLowerCase();
+  const refusalPatterns = [
+    /抱歉[^。]{0,50}(无法|不能|请(您)?(使用|通过|访问|打开|输入))/,
+    /(无法|不能)[^。]{0,25}(访问|搜索|联网|链接|连接|打开)[^。]{0,25}(互联网|网络|数据库|网页|网站|外部|实时)/,
+    /(建议|请您|可以帮|帮你|我可以)[^。]{0,25}(使用|通过|访问|打开|输入)[^。]{0,30}(搜索引擎|学术搜索|数据库|google|谷歌|百度学术|ieee|pubmed|scholar)/,
+  ];
+  return refusalPatterns.some((p) => p.test(lower));
+}
+
+/** 是否为「作者」类字段（不含"作者单位"这类机构字段） */
+export function isAuthorField(fieldName: string): boolean {
+  const n = (fieldName || '').trim().toLowerCase();
+  return (n.includes('作者') && !n.includes('单位')) || /(^|\b)authors?\b/.test(n);
+}
+
+/** 相关文献值结构校验：合法值应为"多条文献列表"（换行/编号/分号分隔的多条短条目）。
+ *  拒答话术和操作指引都是散文段落——单段长文、无任何条目结构 → 直接判无效。
+ *  这是对枚举黑名单的结构性替代：无论 AI 怎么换措辞，散文都过不了这条。 */
+export function isRelatedWorkValuePlausible(v: string): boolean {
+  const s = (v || '').trim();
+  if (!s) return false;
+  if (s === '未提及' || s === '无') return true;
+  const lines = s.split(/\n+/).map((x) => x.trim()).filter(Boolean);
+  if (lines.length >= 2) return true;                                  // 换行分条
+  const numbered = s.match(/(?:^|\n|\s)\d{1,2}[.、）)]\s*\S/g);
+  if (numbered && numbered.length >= 2) return true;                   // 1. 2. 3. 编号分条
+  const semi = s.split(/[；;]/).map((x) => x.trim()).filter((x) => x.length >= 8 && x.length <= 160);
+  if (semi.length >= 3) return true;                                   // 分号分条
+  return false;                                                        // 单段散文 → 不是文献列表
 }
 
 /** 标题防呆版本：v2 起标题"无"/引文串必须经过单字段精读确认后才算终值。
@@ -289,6 +320,11 @@ export function looksLikeMetadataDump(fieldName: string, v: string): boolean {
     }
   }
   if (labelCount >= 3) return true; // 3 个以上"标签："→ 元数据罗列，不是内容概括
+  // v6.14：书目特征词直接判元数据（自然语句式污染没有"标签："结构，用特征词抓：
+  // 内容摘要/关键词里出现 ISSN/ISBN/DOI/出版社/投稿日期等，几乎必然是版权页信息混入）
+  if (/issn|isbn|\bdoi\b|10\.\d{4,}\//i.test(s)) return true;
+  if (/投稿日期|接收日期|收稿日期|出版日期|版权页|出版社|出版时间|丛\s*书|主编|副主编/.test(s)) return true;
+  if (/\b97[89]\d{10}\b/.test(s)) return true; // ISBN-13 裸数字
   return false;
 }
 
@@ -303,6 +339,8 @@ export function isFieldValueValid(fieldName: string, v: string | null | undefine
   if (isEmptyValue(s) || isTemplateResidue(s)) return false;
   // AI 的"搜索式编造/操作指引"垃圾（伪装搜索结果、承认虚构、教用户去 Google Scholar）
   if (looksLikeFabrication(s)) return false;
+  // 相关文献必须是"多条目列表"结构：单段散文（拒答/操作指引的典型形态）→ 无效
+  if (isRelatedWorkField(fieldName) && !isRelatedWorkValuePlausible(s)) return false;
   // 摘要/关键词被写成"作者：xxx；单位：xxx"式元数据罗列 → 无效，触发重提
   if (looksLikeMetadataDump(fieldName, s)) return false;
   if (description && isDescriptionEcho(s, description)) return false;
@@ -438,9 +476,13 @@ async function callOnce(
       ? `\n- 特别规则：概括研究内容本身（问题/方法/发现），80-200 字；严禁写作者名、期刊/出版社、投稿出版日期、ISBN 等任何元数据。`
       : '';
     const rwRule = isRelatedWorkField(f.name)
-      ? `\n- 特别规则：从文末 References 列表挑最相关的 3-5 条原样著录；严禁编造文献、严禁任何搜索指引或拒答话术；无 References 栏时只填 "未提及"。`
+      ? `\n- 特别规则：从文末 References 列表挑最相关的 3-5 条，逐条一行原样著录（作者. 标题. 出处. 年份，每条单独一行）；严禁编造文献、严禁任何搜索指引或拒答话术；无 References 栏时只填 "未提及"。`
       : '';
-    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 内容要具体、有信息量，写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。${etRule}${titleRule}${kwRule}${absRule}${rwRule}\n\n【文献全文】\n${text}`;
+    // v6.14 首页锚定：标题/作者几乎总在全文最开头，把开头单独再喂一遍，防止模型在长文里"找不到"而填"无"
+    const anchor = (isTitleField(f.name) || isAuthorField(f.name)) && text.length > 3000
+      ? `\n\n【全文最开头 1500 字（标题和作者通常就在这里，请优先在这里定位）】\n${text.slice(0, 1500)}`
+      : '';
+    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 内容要具体、有信息量，写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。${etRule}${titleRule}${kwRule}${absRule}${rwRule}${anchor}\n\n【文献全文】\n${text}`;
   } else {
     ({ system, user } = buildPrompt(text, fields));
   }
