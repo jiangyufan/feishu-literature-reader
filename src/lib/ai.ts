@@ -341,6 +341,10 @@ function looksLikeWebBibliography(v: string): boolean {
     'http', 'https', 'www.', '.com', '.org', '.net', '.gov', '.edu', '.cn',
     'wikipedia', 'wiki', 'public art 101', 'from concept to commission', 'national civic league',
     'americans for the arts', 'unesco', 'creative city', 'creative cities',
+    // v6.16.2：常见学术搜索/数据库域名（AI 常在这些平台编造搜索推荐）
+    'scholar.google', 'webofscience.com', 'web of science', 'scopus.com', 'scopus', 'cnki.net',
+    'cnki', 'jstor.org', 'jstor', 'pubmed', 'ieee', 'researchgate', 'springer', 'elsevier',
+    'mdpi', 'arxiv.org', 'arxiv', 'ssrn',
   ];
   if (webMarkers.some((m) => s.includes(m))) return true;
   // 2. 包含 "(n.d.)" / "(nd)" / "no date" 等无年份占位（真实书目极少这样著录）
@@ -407,6 +411,24 @@ export function looksLikeCitation(v: string): boolean {
   return false;
 }
 
+/** 判断值是否是期刊/专著的"专题节点/特刊/栏目名"而不是论文本身的标题。
+ *  典型：baseInfo 里写"所属专题节点：Materiology and Variantology: invitation to dialogue"，
+ *  AI 却把专题节点名填进"英文标题/中文题目"。 */
+export function isSpecialIssueNodeTitle(v: string, baseInfo?: string): boolean {
+  const s = (v || '').trim();
+  if (!s || !baseInfo) return false;
+  const info = baseInfo.toLowerCase();
+  // 基础信息里明确提到"专题节点""special issue""collection""特刊""专栏"等
+  if (!/专题节点|special\s*issue|特刊|专栏|collection|section| тема|monographic/i.test(info)) return false;
+  // 标题值与基础信息中的节点名高度重合（通常节点名很长且带冒号，直接子串包含）
+  const ns = normalizeText(s);
+  const ni = normalizeText(baseInfo);
+  if (ns.length >= 6 && (ni.includes(ns) || ns.includes(ni.slice(0, Math.min(ni.length, ns.length + 20))))) return true;
+  // 标题本身像"主题+invitation/call for"这类会议/特刊召集语，且基础信息里没有这个标题作为文章标题的线索
+  if (/invitation\s+to\s+dialogue|call\s+for\s+papers|proceedings\s+of|selected\s+papers|monographic/i.test(s)) return true;
+  return false;
+}
+
 /** 特殊字段归一化：英文标题提取结果不含英文字母（纯中文/书名号包中文书名）→ 视为没有英文标题，统一写「无」 */
 export function normalizeSpecialFieldValue(fieldName: string, v: string): string {
   if (isEnglishTitleField(fieldName)) {
@@ -449,13 +471,20 @@ export function looksLikeMetadataDump(fieldName: string, v: string): boolean {
   const hasAuthorMeta = /作者[为是：:]|作者包括|作者分别|作者来自|author/i.test(s);
   const hasYear = /(19|20)\d{2}\s*年|\b(?:19|20)\d{2}\b/i.test(s);
   const hasAffil = /大学|学院|系|研究所|university|department|institute|laboratory|理工|天主教|瓦尔帕莱索|加泰罗尼亚|卡斯蒂利亚/i.test(s);
-  if (isAbstractField(fieldName)) {
-    // 摘要堆题录：期刊+卷/文章编号，或 作者+单位/年份（真实摘要不会这么写）
-    if ((hasJournal && (hasVol || hasYear)) || (hasAuthorMeta && (hasAffil || hasYear))) return true;
-  }
+  // v6.16.2：关键词里出现期刊/卷期/DOI/投稿接收发表日期等题录信息 → 必定不是关键词
+  const hasDateProcess = /投稿日期|接收日期|收稿日期|发表日期|出版时间|在线发表|投稿|接收|修订/i.test(s);
+  const hasDOI = /\bdoi\b|doi:|10\.\d{4,}\//i.test(s);
   if (isKeywordField(fieldName)) {
     // 关键词出现机构/单位名（大学/学院/系等）→ 几乎必是题录误填
     if (hasAffil) return true;
+    // 关键词出现期刊名/卷期/DOI/投稿接收发表日期/文章编号 → 必是题录误填
+    if ((hasJournal && (hasVol || hasYear)) || hasDOI || hasDateProcess || /第\s*\d+\s*(?:期|卷)|\bvol\.?\s*\d+|no\.\s*\d+/i.test(s)) return true;
+  }
+  if (isAbstractField(fieldName)) {
+    // 摘要堆题录：期刊+卷/文章编号，或 作者+单位/年份，或"本文为发表于…"
+    if ((hasJournal && (hasVol || hasYear)) || (hasAuthorMeta && (hasAffil || hasYear))) return true;
+    // "本文为发表于 X 期刊 Y 期" / "本文发表于 X 期刊" / "文章发表于" 等开头陈述 → 题录复述
+    if (/^(本文|文章|本研究|该文|该研究)[是为]?\s*(?:发表|出版|刊载|刊于|载于|收录|来自)/i.test(s)) return true;
   }
   return false;
 }
@@ -480,7 +509,8 @@ export function looksLikeBaseInfoDump(fieldName: string, v: string, baseInfo: st
 }
 
 /** 字段值是否为有效终值（可直接写入表格 / 视为"已提取"）。
- * 注意：「英文标题」的"无"是合法终值（确实没有英文标题），不能再当成空值反复重提。 */
+ * 注意：「英文标题」的"无"是合法终值（确实没有英文标题），不能再当成空值反复重提。
+ * 注意：「作者」字段返回"无"/"未提及" → 无效，文章必有作者，必须重提。 */
 export function isFieldValueValid(
   fieldName: string,
   v: string | null | undefined,
@@ -489,9 +519,13 @@ export function isFieldValueValid(
 ): boolean {
   const s = v == null ? '' : (typeof v === 'string' ? v : String(v)).trim();
   if (!s) return false;
+  // 作者字段："无" 不是合法值（论文/专著首页必有作者），空值/占位符也不行
+  if (isAuthorField(fieldName) && (s === '无' || isEmptyValue(s) || isTemplateResidue(s))) return false;
   if (isEnglishTitleField(fieldName) && s === '无') return true;
   // 标题类字段返回了引文/出处串（AI 把引用格式当标题）→ 无效
   if (isTitleField(fieldName) && looksLikeCitation(s)) return false;
+  // 标题类字段：与 baseInfo 里的"专题节点/特刊名"重合 → 不是论文本身的标题
+  if (isTitleField(fieldName) && isSpecialIssueNodeTitle(s, extra?.baseInfo)) return false;
   if (isEmptyValue(s) || isTemplateResidue(s)) return false;
   // AI 的"搜索式编造/操作指引"垃圾（伪装搜索结果、承认虚构、教用户去 Google Scholar）
   if (looksLikeFabrication(s)) return false;
@@ -652,13 +686,16 @@ async function callOnce(
       ? `\n- 特别规则：概括研究内容本身（问题/方法/发现），80-200 字；严禁写作者名、期刊/出版社、投稿出版日期、ISBN 等任何元数据。`
       : '';
     const rwRule = isRelatedWorkField(f.name)
-      ? `\n- 特别规则：从文末 References 列表挑最相关的 3-5 条，逐条一行原样著录（作者. 标题. 出处. 年份，每条单独一行）；严禁编造文献、严禁任何搜索指引或拒答话术；无 References 栏时只填 "未提及"，不要列出 Wikipedia、外部网址或通用书名/机构页凑数。`
+      ? `\n- 特别规则：从文末 References 列表挑最相关的 3-5 条，逐条一行原样著录（作者. 标题. 出处. 年份，每条单独一行）；严禁编造文献、严禁任何搜索指引或拒答话术；无 References 栏时只填 "未提及"，不要列出 Wikipedia、Google Scholar、Web of Science、Scopus、CNKI、JSTOR 或任何外部网址凑数。`
       : '';
     // v6.14 首页锚定：标题/作者几乎总在全文最开头，把开头单独再喂一遍，防止模型在长文里"找不到"而填"无"
-    const anchor = (isTitleField(f.name) || isAuthorField(f.name)) && text.length > 3000
-      ? `\n\n【全文最开头 1500 字（标题和作者通常就在这里，请优先在这里定位）】\n${text.slice(0, 1500)}`
-      : '';
-    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 内容要具体、有信息量，写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。${etRule}${titleRule}${kwRule}${absRule}${rwRule}${anchor}\n\n【文献全文】\n${text}`;
+    // v6.16.2：作者字段首页锚定范围扩大到 2500 字（部分论文作者信息分散在前言/脚注）
+    let anchorText = '';
+    if ((isTitleField(f.name) || isAuthorField(f.name)) && text.length > 3000) {
+      const anchorLen = isAuthorField(f.name) ? 2500 : 1500;
+      anchorText = `\n\n【全文最开头 ${anchorLen} 字（标题和作者通常就在这里，请优先在这里定位）】\n${text.slice(0, anchorLen)}`;
+    }
+    user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 内容要具体、有信息量，写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。${etRule}${titleRule}${kwRule}${absRule}${rwRule}${anchorText}\n\n【文献全文】\n${text}`;
   } else {
     ({ system, user } = buildPrompt(text, fields));
   }

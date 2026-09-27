@@ -34,7 +34,7 @@ const CACHE_PREFIX = 'litcache:';
 // 配置版本：v6.9（=2）起"仅补提空字段"默认改为不勾选，旧存储只恢复 API 配置、不再恢复旧勾选状态
 const CFG_VER = 2;
 // 面板版本号（显示在标题 + 写入每条记录的完成/失败消息，便于从导出截图追溯实际运行的代码版本）
-const APP_VER = 'v6.16.1';
+const APP_VER = 'v6.16.2';
 // 缓存结构版本：v6.14（=3）起缓存只存有效值；旧结构缓存（无 cacheVer 或版本更低）整体作废，
 // 根除"历史污染值长年留在缓存里 → 写不进（被校验拦）也清不掉（被 hasNew 误判为有值）"的死锁。
 const CACHE_VER = 3;
@@ -75,10 +75,13 @@ function setCache(key: string, fields: Record<string, string>) {
   try {
     // v6.14：只缓存有效值——拒答话术/元数据罗列/占位符/引文串不进缓存，
     // 否则它们会让清理循环的 hasNew 误判"本次有值"而跳过擦表（污染死锁的根源）
+    // v6.16.2：缓存校验也传入 extra（baseInfo + referencesText），避免相关文献/摘要因缺上下文而通过
     const clean: Record<string, string> = {};
+    const baseInfo = fields['基础信息'] || fields['文章信息'] || '';
+    const referencesText = fields['相关文献'] || fields['参考文献'] || ''; // 缓存阶段可用已提的相关文献文本近似（或空）
     for (const [k, raw] of Object.entries(fields || {})) {
       const s = normalizeSpecialFieldValue(k, String(raw ?? '')).trim();
-      if (s && isFieldValueValid(k, s)) clean[k] = s;
+      if (s && isFieldValueValid(k, s, undefined, { baseInfo, referencesText })) clean[k] = s;
     }
     localStorage.setItem(key, JSON.stringify({ fields: clean, guardVer: TITLE_GUARD_VER, cacheVer: CACHE_VER, ts: Date.now() }));
   } catch { /* 配额超限忽略 */ }
@@ -458,7 +461,9 @@ export default function App() {
         const entry = getCache(cacheKey(rid, atts[0].token));
         const titlesTrusted = !!entry && entry.guardVer >= TITLE_GUARD_VER;
         const valid = (tf: TargetField, curStr: string): boolean => {
-          if (!isFieldValueValid(tf.name, curStr, tf.description, { referencesText: '' })) return false;
+          // v6.16.2：预扫也传入 baseInfo（取当前记录的"基础信息"/"文章信息"），确保"摘要"与基础信息重复的题录污染被识别为空字段
+          const curBaseInfo = String(((rec.fields as any)['基础信息'] || (rec.fields as any)['文章信息']) ?? '');
+          if (!isFieldValueValid(tf.name, curStr, tf.description, { baseInfo: curBaseInfo, referencesText: '' })) return false;
           if (!titlesTrusted && titleNeedsRecheck(tf.name, curStr)) return false;
           return true;
         };

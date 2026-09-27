@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.16.1 无References栏专著/教材的相关文献禁止编造: looksLikeWebBibliography拦截所有外部链接/Wikipedia/通用机构页;无refBlock直接拒绝列表;提示词强制"未提及"'
+msg = 'deploy: v6.16.2 作者字段禁"无"/标题防专题节点名/关键词拦截期刊卷期DOI日期/摘要防题录复述/baseInfo传预扫与setCache'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 
