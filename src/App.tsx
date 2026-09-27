@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel, stripThinkTags } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -34,7 +34,7 @@ const CACHE_PREFIX = 'litcache:';
 // 配置版本：v6.9（=2）起"仅补提空字段"默认改为不勾选，旧存储只恢复 API 配置、不再恢复旧勾选状态
 const CFG_VER = 2;
 // 面板版本号（显示在标题 + 写入每条记录的完成/失败消息，便于从导出截图追溯实际运行的代码版本）
-const APP_VER = 'v6.14';
+const APP_VER = 'v6.15';
 // 缓存结构版本：v6.14（=3）起缓存只存有效值；旧结构缓存（无 cacheVer 或版本更低）整体作废，
 // 根除"历史污染值长年留在缓存里 → 写不进（被校验拦）也清不掉（被 hasNew 误判为有值）"的死锁。
 const CACHE_VER = 3;
@@ -101,6 +101,8 @@ async function writeFields(
       let v = key ? fields[key] : undefined;
       if (v == null) { emptyCount += 1; continue; }
       v = typeof v === 'string' ? v : String(v);
+      // 兜底剥离模型推理标签（部分模型在字段值里夹带 <think>…</think>，AI 层已剥过一次，这里再保一道）
+      v = stripThinkTags(v);
       // 特殊字段归一化（如英文标题：没有英文字母 → 统一写"无"）
       v = normalizeSpecialFieldValue(tf.name, v);
       if (!v.trim()) { emptyCount += 1; continue; }

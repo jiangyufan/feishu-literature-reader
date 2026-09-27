@@ -155,6 +155,17 @@ export function isTemplateResidue(v: string): boolean {
   return false;
 }
 
+/** 剥离模型推理标签：部分模型会在正文里夹带 <think:6124c78e>...</think:6124c78e> 或裸 </think>/<think>，
+ * 若不清理会直接污染字段值（如"公共艺术的观念与方法</think>公共艺术的观念与方法"）。 */
+export function stripThinkTags(s: string): string {
+  if (!s) return s;
+  return s
+    .replace(/<think:6124c78e>[\s\S]*?<\/think>/gi, ' ')
+    .replace(/<\/?think>/gi, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 /** 简单文本归一化（去空白/标点/大小写），用于计算相似度 */
 function normalizeText(s: string): string {
   return s
@@ -440,7 +451,25 @@ export function parseFieldsJson(raw: string): Record<string, string> {
   const end = s.lastIndexOf('}');
   if (start >= 0 && end > start) s = s.slice(start, end + 1);
   try {
-    return JSON.parse(s);
+    const obj = JSON.parse(s);
+    // 强制把所有值转成字符串：AI 偶尔把数字/布尔（如发表年份、字数）当作 JSON 原生类型返回，
+    // 不转字符串会导致后续 v.trim() 在数值上抛 "X.trim is not a function"（记录3崩溃根因）
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      const out: Record<string, string> = {};
+      for (const [k, val] of Object.entries(obj)) {
+        if (k === '_error') { out[k] = String(val); continue; }
+        const str = val == null
+          ? ''
+          : Array.isArray(val)
+            ? val.join('；')
+            : typeof val === 'string'
+              ? val
+              : String(val);
+        out[k] = stripThinkTags(str);
+      }
+      return out;
+    }
+    return { _error: 'AI 未返回有效 JSON: ' + s.slice(0, 500) };
   } catch {
     // 3. 如果仍然不是合法 JSON，返回 fallback
     return { _error: 'AI 未返回有效 JSON: ' + s.slice(0, 500) };
@@ -514,7 +543,7 @@ async function callOnce(
   const content = data?.choices?.[0]?.message?.content ?? '';
   if (deep) {
     // 精读模式：模型按指令直接输出该字段的值（纯文本），不包 JSON
-    const v = content.trim();
+    const v = stripThinkTags(content.trim());
     return { fields: { [fields[0].name]: v }, usage: data?.usage, raw: v };
   }
   const fieldsResult = parseFieldsJson(content);
@@ -623,8 +652,11 @@ export async function extractFieldsAuto(
     // 仍缺的字段：空/未提及/模板残留/描述回声都视为没拿到
     const missing = fields.filter((f) => {
       const v = merged[f.name];
-      if (!v || !v.trim() || isEmptyValue(v) || isTemplateResidue(v)) return true;
-      return isDescriptionEcho(v, f.description);
+      // 强制转字符串：merged 里可能有非字符串（AI 把数字当 JSON 原生类型返回），
+      // 直接 v.trim() 会在数值上抛 "X.trim is not a function"（记录3崩溃根因）
+      const sv = v == null ? '' : (typeof v === 'string' ? v : String(v));
+      if (!sv.trim() || isEmptyValue(sv) || isTemplateResidue(sv)) return true;
+      return isDescriptionEcho(sv, f.description);
     });
     if (!missing.length) break;
 
