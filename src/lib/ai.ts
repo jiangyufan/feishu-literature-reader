@@ -248,6 +248,13 @@ export function looksLikeFabrication(v: string): boolean {
     '无法直接搜索互联网或访问外部数据库', '建议直接访问相关的学术数据库',
     '无法直接访问互联网和实时数据库', '基于您提供的参考数据', '这些信息是基于您提供的',
     '示例，这些信息', '标题和发表年份的示例', '链接和发表年份的示例', '真实链接和发表年份',
+    // v6.16.1 补充：专著无 References 栏时 AI 用外部知识/网页搜索凑数的话术与假源
+    '未提供年份', '年份未提供', '年份信息未提供', '出版年份未提供',
+    '维基百科', 'wikipedia', 'wiki', 'public art 101', 'from concept to commission',
+    'national civic league', ' Americans for the Arts', '(pdf)', '[pdf]', 'pdf 全文',
+    '相关链接', '链接如下', '参考链接', '请.*注意.*链接', '请.*查看.*链接',
+    '访问以下', '参见以下', '详见以下', '更多.*参考', '以下网站', '以下网址', '网上资料',
+    '(n.d.)', 'no date', 'no. ', 'pp. ', 'eds.', 'ed.', 'isbn:',
   ];
   if (markers.some((m) => s.toLowerCase().includes(m.toLowerCase()))) return true;
   // v6.14 结构化拒答识别（正则模式而非枚举）：AI 每轮都会换新措辞，枚举永远追不完。
@@ -324,27 +331,49 @@ function itemHit(item: string, refBlock: string): boolean {
   return false;
 }
 
+/** 判断值是否是"外部知识/网页搜索式参考书目"（专著无 References 栏时 AI 常编造）。
+ *  命中任意一条 → 直接判为编造，不允许写入相关文献字段。 */
+function looksLikeWebBibliography(v: string): boolean {
+  const s = (v || '').trim().toLowerCase();
+  if (!s) return false;
+  // 1. 包含明显的网页/外部链接或通用知识型短语
+  const webMarkers = [
+    'http', 'https', 'www.', '.com', '.org', '.net', '.gov', '.edu', '.cn',
+    'wikipedia', 'wiki', 'public art 101', 'from concept to commission', 'national civic league',
+    'americans for the arts', 'unesco', 'creative city', 'creative cities',
+  ];
+  if (webMarkers.some((m) => s.includes(m))) return true;
+  // 2. 包含 "(n.d.)" / "(nd)" / "no date" 等无年份占位（真实书目极少这样著录）
+  if (/\(n\.d\.\)|\(nd\)|no date|year unknown|unknown year|年份未提供|未提供年份|无年份|不详/.test(v)) return true;
+  // 3. 含 "参见" / "可参考" / "更多阅读" / "网上" 等指引词
+  if (/参见|可参考|更多阅读|延伸阅读|网上|网站|网址|链接|下载|pdf全文|pdf文档|电子书/.test(v)) return true;
+  // 4. 条目格式像 "书名. 网站名. (n.d.)" 这种外部推荐
+  if (/[《"'].*?[》"'].*?(网站|网|平台|数据库|library|archive|foundation|council|league|101)/i.test(v)) return true;
+  return false;
+}
+
 /** 相关文献值结构 + 正向校验。
  *  合法值必须：
  *   1) 是"多条目列表"（换行/编号/分号分隔）；
  *   2) 至少 N 条能在原文 References 区块里找到依据（命中标题/作者/DOI）。
- *  无 References 栏的专著可返回 "未提及"/"无"/空；此时放宽结构校验但仍拒绝明显编造列表。 */
+ *  无 References 栏的专著只能返回 "未提及"/"无"/空；任何带外部链接/网页搜索/Wikipedia/年份占位的列表都视为编造。 */
 export function isRelatedWorkValuePlausible(v: string, refBlock?: string): boolean {
   const s = (v || '').trim();
   if (!s) return false;
   if (s === '未提及' || s === '无') return true;
   // 全文级别拒答/编造/操作指引（比条目级更稳，如 example.com 假链接+"请注意以上为示例"）
-  if (looksLikeFabrication(s) || isEmptyValue(s)) return false;
+  if (looksLikeFabrication(s) || looksLikeWebBibliography(s) || isEmptyValue(s)) return false;
   const items = splitRelatedWorkItems(s);
   if (items.length < 2) return false;                                  // 单段散文/单条 → 不是文献列表
 
-  // 未提供 References 文本（比如旧调用或专著没有 References）→ 退回到结构校验
-  if (!refBlock || refBlock.length < 20) return true;
+  // 未提供 References 文本（比如旧调用或专著没有 References）→ 只允许 "未提及"/"无"/空；
+  // 任何看起来是"参考书目列表"的值都视为 AI 编造/外部知识凑数。
+  if (!refBlock || refBlock.length < 20) return false;
 
   // 至少 2 条命中，或命中率 ≥40%，且没有明显搜索/编造话术
   let hits = 0;
   for (const it of items) {
-    if (looksLikeFabrication(it) || isEmptyValue(it)) return false;
+    if (looksLikeFabrication(it) || looksLikeWebBibliography(it) || isEmptyValue(it)) return false;
     if (itemHit(it, refBlock)) hits++;
   }
   const ratio = hits / items.length;
@@ -544,7 +573,7 @@ function buildPrompt(text: string, fields: TargetField[]): { system: string; use
   // 相关文献字段：只允许原文 References 里真实存在的条目
   const rwFields = fields.filter((f) => isRelatedWorkField(f.name));
   const rwRule = rwFields.length
-    ? `\n- ${rwFields.map((f) => `「${f.name}」`).join('、')}：从文末参考文献（References）列表中挑出最相关的 3-5 条，逐条列出"作者. 标题. 出处. 年份"，格式参考原文献的著录方式（如 GB/T 7714 或文中既有格式）；严禁编造原文参考文献列表中不存在的文献；严禁插入任何互联网搜索行为、操作指引（"打开 Google Scholar"等）或"无法访问互联网"之类的说明——你手上就是全文，文末就有真实参考文献。若确实无参考文献栏，填 "未提及"。`
+    ? `\n- ${rwFields.map((f) => `「${f.name}」`).join('、')}：从文末参考文献（References）列表中挑出最相关的 3-5 条，逐条列出"作者. 标题. 出处. 年份"，格式参考原文献的著录方式（如 GB/T 7714 或文中既有格式）；严禁编造原文参考文献列表中不存在的文献；严禁插入任何互联网搜索行为、操作指引（"打开 Google Scholar"等）或"无法访问互联网"之类的说明——你手上就是全文，文末就有真实参考文献。若确实没有"References"或"参考文献"栏（例如专著/教材的正文并未附带文献列表），只填 "未提及" 一个词；不要列出 Wikipedia、Google Scholar、博客或任何外部网址；不要编造"Public Art 101"、"From Concept to Commission"、"Americans for the Arts" 等通用书名或机构页作为文献。`
     : '';
   return {
     system: `你是一位学术文献阅读助手。下面是一份文献（论文、专著或整本书）经解析得到的全文文本，共 ${text.length} 个字符，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。你没有联网能力，也不需要联网——所有答案都在文本里。`,
@@ -623,7 +652,7 @@ async function callOnce(
       ? `\n- 特别规则：概括研究内容本身（问题/方法/发现），80-200 字；严禁写作者名、期刊/出版社、投稿出版日期、ISBN 等任何元数据。`
       : '';
     const rwRule = isRelatedWorkField(f.name)
-      ? `\n- 特别规则：从文末 References 列表挑最相关的 3-5 条，逐条一行原样著录（作者. 标题. 出处. 年份，每条单独一行）；严禁编造文献、严禁任何搜索指引或拒答话术；无 References 栏时只填 "未提及"。`
+      ? `\n- 特别规则：从文末 References 列表挑最相关的 3-5 条，逐条一行原样著录（作者. 标题. 出处. 年份，每条单独一行）；严禁编造文献、严禁任何搜索指引或拒答话术；无 References 栏时只填 "未提及"，不要列出 Wikipedia、外部网址或通用书名/机构页凑数。`
       : '';
     // v6.14 首页锚定：标题/作者几乎总在全文最开头，把开头单独再喂一遍，防止模型在长文里"找不到"而填"无"
     const anchor = (isTitleField(f.name) || isAuthorField(f.name)) && text.length > 3000
