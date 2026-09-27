@@ -5,6 +5,14 @@ export interface TargetField {
   description: string; // 字段描述（可选，来自表里的"提示词"或字段名本身）
 }
 
+/** 提取结果通用结构 */
+export interface ExtractResult {
+  fields: Record<string, string>;
+  raws: string[];
+  /** 从原文末尾切出的 References / 参考文献 区块，用于相关文献正向校验 */
+  referencesText: string;
+}
+
 export interface ProviderConfig {
   label: string;
   baseUrl: string;
@@ -148,8 +156,8 @@ export function isEmptyValue(v: string): boolean {
 export function isTemplateResidue(v: string): boolean {
   if (!v || !v.trim()) return true;
   const s = v.trim();
-  // 仍包含 [xxx] 占位符，说明 AI 没有替换
-  if (/\[.+?\]/.test(s)) return true;
+  // 仍包含 [xxx] 占位符，说明 AI 没有替换；但 [1]/[12] 这类纯数字编号是合法引用格式，不算占位
+  if (/\[[^\d\s]+?\]/.test(s)) return true;
   // 包含连续省略号（半角 ... 或全角 ……），大概率是模板未填充
   if (/\.{2,}|…{2,}/.test(s)) return true;
   return false;
@@ -259,20 +267,89 @@ export function isAuthorField(fieldName: string): boolean {
   return (n.includes('作者') && !n.includes('单位')) || /(^|\b)authors?\b/.test(n);
 }
 
-/** 相关文献值结构校验：合法值应为"多条文献列表"（换行/编号/分号分隔的多条短条目）。
- *  拒答话术和操作指引都是散文段落——单段长文、无任何条目结构 → 直接判无效。
- *  这是对枚举黑名单的结构性替代：无论 AI 怎么换措辞，散文都过不了这条。 */
-export function isRelatedWorkValuePlausible(v: string): boolean {
+/** 从文献全文末尾切出 References / Bibliography / 参考文献 区块（约 80 万字符）。
+ *  用于相关文献正向校验：只有出现在这个区块里的条目，才允许写入表格。 */
+export function extractReferencesBlock(text: string): string {
+  if (!text) return '';
+  // 找 References / Bibliography / 参考文献 标题；优先英文，中文兜底
+  const m = text.match(/(?:^|\n)(?:References|REFERENCES|Bibliography|BIBLIOGRAPHY|参考文献|参考文獻)\s*\n([\s\S]{0,800000})/im);
+  let block = m ? m[1] : '';
+  // 截断到下一个章节标题之前（如 "Appendix"、"Acknowledgements"、下一个 "\n\d+\. " 主标题）
+  const stop = block.search(/\n(?=Appendix|Acknowledgements|Acknowledgments|Author contributions|Funding|Conflict of interest|Data availability|Supplementary|Figure|Table|注释|致谢|附录|第[一二三四五六七八九十\d]+章)/i);
+  if (stop > 100) block = block.slice(0, stop);
+  return block.trim();
+}
+
+/** 把相关文献值拆成若干独立条目 */
+function splitRelatedWorkItems(v: string): string[] {
+  const s = (v || '').trim();
+  if (!s) return [];
+  // 先按 markdown 列表 / 编号 / 换行拆分常见形态
+  const items = s
+    .split(/\n+/)
+    .map((x) => x.replace(/^\s*[-•*]+\s*/, '').replace(/^\s*\d+\s*[.、．)\]]\s*/, '').trim())
+    .filter(Boolean);
+  if (items.length >= 2) return items;
+  // 没有换行则按分号拆
+  const semi = s
+    .split(/[；;]/)
+    .map((x) => x.trim())
+    .filter((x) => x.length >= 8);
+  if (semi.length >= 2) return semi;
+  return [s];
+}
+
+/** 计算一个文献条目与原文 References 区块的命中强度。
+ *  优先匹配 "标题"（长连续字母/中文词）或 "第一作者姓"；任一核心标识在 References 块中即命中。 */
+function itemHit(item: string, refBlock: string): boolean {
+  const ref = refBlock.toLowerCase();
+  const items = item.toLowerCase();
+  // 0. 整句/整条目在 References 里（部分 AI 会原样著录）
+  if (ref.includes(items) || items.includes(ref.slice(0, 120))) return true;
+  // 1. 提取疑似标题：最长的一段连续非标点文字（通常是论文标题 or 书名）
+  const titleLike = item.match(/[a-z0-9\u4e00-\u9fa5]{4,}(?:\s+[a-z0-9\u4e00-\u9fa5]+){1,}/gi) || [];
+  for (const t of titleLike) {
+    if (t.length >= 8 && ref.includes(t.toLowerCase())) return true;
+  }
+  // 2. 提取第一作者姓氏：开头 "Baumeister," / "N. Catbas," / "Marburger," / "孙振华"
+  const author = item.match(/^\s*([A-Z][a-z]+|[\u4e00-\u9fa5]{2,4})/);
+  if (author) {
+    const family = author[1].toLowerCase();
+    // 姓氏在 References 块中多处出现，更可信
+    if ((ref.match(new RegExp('\\b' + family + '\\b', 'g')) || []).length >= 1) return true;
+  }
+  // 3. DOI 匹配
+  const doi = item.match(/10\.\d{4,}\/[^\s\])}]+/);
+  if (doi && ref.includes(doi[0].toLowerCase())) return true;
+  return false;
+}
+
+/** 相关文献值结构 + 正向校验。
+ *  合法值必须：
+ *   1) 是"多条目列表"（换行/编号/分号分隔）；
+ *   2) 至少 N 条能在原文 References 区块里找到依据（命中标题/作者/DOI）。
+ *  无 References 栏的专著可返回 "未提及"/"无"/空；此时放宽结构校验但仍拒绝明显编造列表。 */
+export function isRelatedWorkValuePlausible(v: string, refBlock?: string): boolean {
   const s = (v || '').trim();
   if (!s) return false;
   if (s === '未提及' || s === '无') return true;
-  const lines = s.split(/\n+/).map((x) => x.trim()).filter(Boolean);
-  if (lines.length >= 2) return true;                                  // 换行分条
-  const numbered = s.match(/(?:^|\n|\s)\d{1,2}[.、）)]\s*\S/g);
-  if (numbered && numbered.length >= 2) return true;                   // 1. 2. 3. 编号分条
-  const semi = s.split(/[；;]/).map((x) => x.trim()).filter((x) => x.length >= 8 && x.length <= 160);
-  if (semi.length >= 3) return true;                                   // 分号分条
-  return false;                                                        // 单段散文 → 不是文献列表
+  // 全文级别拒答/编造/操作指引（比条目级更稳，如 example.com 假链接+"请注意以上为示例"）
+  if (looksLikeFabrication(s) || isEmptyValue(s)) return false;
+  const items = splitRelatedWorkItems(s);
+  if (items.length < 2) return false;                                  // 单段散文/单条 → 不是文献列表
+
+  // 未提供 References 文本（比如旧调用或专著没有 References）→ 退回到结构校验
+  if (!refBlock || refBlock.length < 20) return true;
+
+  // 至少 2 条命中，或命中率 ≥40%，且没有明显搜索/编造话术
+  let hits = 0;
+  for (const it of items) {
+    if (looksLikeFabrication(it) || isEmptyValue(it)) return false;
+    if (itemHit(it, refBlock)) hits++;
+  }
+  const ratio = hits / items.length;
+  if (hits >= 2 && ratio >= 0.4) return true;
+  return false;
 }
 
 /** 标题防呆版本：v2 起标题"无"/引文串必须经过单字段精读确认后才算终值。
@@ -375,7 +452,12 @@ export function looksLikeBaseInfoDump(fieldName: string, v: string, baseInfo: st
 
 /** 字段值是否为有效终值（可直接写入表格 / 视为"已提取"）。
  * 注意：「英文标题」的"无"是合法终值（确实没有英文标题），不能再当成空值反复重提。 */
-export function isFieldValueValid(fieldName: string, v: string | null | undefined, description = '', extra?: { baseInfo?: string }): boolean {
+export function isFieldValueValid(
+  fieldName: string,
+  v: string | null | undefined,
+  description = '',
+  extra?: { baseInfo?: string; referencesText?: string }
+): boolean {
   const s = v == null ? '' : (typeof v === 'string' ? v : String(v)).trim();
   if (!s) return false;
   if (isEnglishTitleField(fieldName) && s === '无') return true;
@@ -384,8 +466,8 @@ export function isFieldValueValid(fieldName: string, v: string | null | undefine
   if (isEmptyValue(s) || isTemplateResidue(s)) return false;
   // AI 的"搜索式编造/操作指引"垃圾（伪装搜索结果、承认虚构、教用户去 Google Scholar）
   if (looksLikeFabrication(s)) return false;
-  // 相关文献必须是"多条目列表"结构：单段散文（拒答/操作指引的典型形态）→ 无效
-  if (isRelatedWorkField(fieldName) && !isRelatedWorkValuePlausible(s)) return false;
+  // 相关文献必须是"多条目列表"结构 且 条目能在原文 References 里命中：单段散文 / 编造列表 → 无效
+  if (isRelatedWorkField(fieldName) && !isRelatedWorkValuePlausible(s, extra?.referencesText)) return false;
   // 摘要/关键词被写成"作者：xxx；单位：xxx"式元数据罗列 → 无效，触发重提
   if (looksLikeMetadataDump(fieldName, s)) return false;
   // 摘要只是「基础信息」的复述（与基础信息高度重合）→ 无效，触发重提
@@ -600,7 +682,7 @@ export async function extractFields(
   cfg: AiConfig,
   signal?: AbortSignal,
   mode: ExtractMode = 'chunk'
-): Promise<{ fields: Record<string, string>; usage: any; raws: string[] }> {
+): Promise<ExtractResult & { usage: any }> {
   const CHUNK = mode === 'all' ? fields.length : mode === 'single' ? 1 : 7;
   const deep = mode === 'single';
   const chunks: TargetField[][] = [];
@@ -648,7 +730,9 @@ export async function extractFields(
   if (okChunks === 0) {
     throw lastError || new Error('AI 提取字段失败（所有批次均失败）');
   }
-  return { fields: merged, usage, raws };
+  // 提取 References 区块，用于后续相关文献字段的正向校验（防止 AI 编造文献）
+  const referencesText = extractReferencesBlock(text);
+  return { fields: merged, usage, raws, referencesText };
 }
 
 /**
@@ -665,13 +749,15 @@ export async function extractFieldsAuto(
   signal?: AbortSignal,
   mode: ExtractMode = 'chunk',
   onProgress?: (segIndex: number, segTotal: number) => void
-): Promise<{ fields: Record<string, string>; raws: string[] }> {
+): Promise<ExtractResult> {
   const SEG = 140000;
   const OVERLAP = 1500;
 
+  const referencesText = extractReferencesBlock(text);
+
   if (text.length <= SEG) {
     const r = await extractFields(text, fields, cfg, signal, mode);
-    return { fields: r.fields, raws: r.raws };
+    return { fields: r.fields, raws: r.raws, referencesText };
   }
 
   // 切段（带重叠）
@@ -701,5 +787,5 @@ export async function extractFieldsAuto(
     raws.push(...r.raws.map((s) => `【第 ${si + 1}/${segs.length} 段】\n${s}`));
   }
 
-  return { fields: merged, raws };
+  return { fields: merged, raws, referencesText };
 }

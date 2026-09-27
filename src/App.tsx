@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel, stripThinkTags } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, ExtractResult, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel, stripThinkTags } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -34,7 +34,7 @@ const CACHE_PREFIX = 'litcache:';
 // 配置版本：v6.9（=2）起"仅补提空字段"默认改为不勾选，旧存储只恢复 API 配置、不再恢复旧勾选状态
 const CFG_VER = 2;
 // 面板版本号（显示在标题 + 写入每条记录的完成/失败消息，便于从导出截图追溯实际运行的代码版本）
-const APP_VER = 'v6.15.1';
+const APP_VER = 'v6.16';
 // 缓存结构版本：v6.14（=3）起缓存只存有效值；旧结构缓存（无 cacheVer 或版本更低）整体作废，
 // 根除"历史污染值长年留在缓存里 → 写不进（被校验拦）也清不掉（被 hasNew 误判为有值）"的死锁。
 const CACHE_VER = 3;
@@ -91,7 +91,8 @@ async function writeFields(
   fields: Record<string, string>,
   effectiveFields: TargetField[],
   onlyEmpty: boolean,
-  titlesTrusted: boolean
+  titlesTrusted: boolean,
+  referencesText?: string
 ): Promise<{ successCount: number; failCount: number; emptyCount: number; echoCount: number; existingCount: number; failedFields: string[]; clearedCount: number }> {
   let successCount = 0, failCount = 0, emptyCount = 0, echoCount = 0, existingCount = 0, clearedCount = 0;
   const failedFields: string[] = [];
@@ -108,14 +109,16 @@ async function writeFields(
       if (!v.trim()) { emptyCount += 1; continue; }
       if (isDescriptionEcho(v, tf.description)) { echoCount += 1; continue; }
       // "无"（英文标题）等合法终值直接写入；真正无效的值（未提及/拒答/模板残留）不写入
-      // v6.15.1：传入「基础信息」做跨字段校验，摘要若只是题录复述则判无效（不写入，触发重提）
-      if (!isFieldValueValid(tf.name, v, undefined, { baseInfo: fields['基础信息'] || fields['文章信息'] || '' })) { emptyCount += 1; continue; }
+      // v6.15.1：传入「基础信息」做跨字段校验；v6.16：传入原文 References 做相关文献正向校验
+      const extra = { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' };
+      if (!isFieldValueValid(tf.name, v, undefined, extra)) { emptyCount += 1; continue; }
       if (onlyEmpty) {
         const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
         const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
-        // 已有"有效且可信"的内容才跳过：表格里未经防呆确认的标题"无"/引文串不算 → 允许用重提的正确标题覆盖
-        const curValid = isFieldValueValid(tf.name, curStr, tf.description) && !(titleNeedsRecheck(tf.name, curStr) && !titlesTrusted);
-        if (curValid) { existingCount += 1; continue; }
+      // 已有"有效且可信"的内容才跳过：表格里未经防呆确认的标题"无"/引文串不算 → 允许用重提的正确标题覆盖
+      const curExtra = { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' };
+      const curValid = isFieldValueValid(tf.name, curStr, tf.description, curExtra) && !(titleNeedsRecheck(tf.name, curStr) && !titlesTrusted);
+      if (curValid) { existingCount += 1; continue; }
       }
       await table.setCellValue(tf.fieldId, job.recordId, v.trim());
       successCount += 1;
@@ -135,14 +138,15 @@ async function writeFields(
       let hasNew = false;
       if (key != null && fields[key] != null) {
         const nv = normalizeSpecialFieldValue(tf.name, String(fields[key])).trim();
-        hasNew = nv !== '' && isFieldValueValid(tf.name, nv, undefined, { baseInfo: fields['基础信息'] || fields['文章信息'] || '' });
+        hasNew = nv !== '' && isFieldValueValid(tf.name, nv, undefined, { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' });
       }
       if (hasNew) continue; // 本次有有效值已正常写入，无需清理
       const rec = await table.getRecordById(job.recordId);
       const cur = rec.fields[tf.fieldId];
       const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
       if (!curStr) continue;
-      const curLooksGarbage = !isFieldValueValid(tf.name, curStr, tf.description)
+      const cleanExtra = { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' };
+      const curLooksGarbage = !isFieldValueValid(tf.name, curStr, tf.description, cleanExtra)
         || (titleNeedsRecheck(tf.name, curStr) && !titlesTrusted);
       if (!curLooksGarbage) continue; // 旧值合法（如英文标题的"无"、用户手工填的正确值）→ 不动
       await table.setCellValue(tf.fieldId, job.recordId, '');
@@ -273,14 +277,14 @@ export default function App() {
       const missing = opts.effectiveFields.filter((f) => {
         const k = Object.keys(cached).find((ck) => ck.trim().toLowerCase() === f.name.trim().toLowerCase());
         const v = k ? cached[k] : undefined;
-        if (!isFieldValueValid(f.name, v, f.description, { baseInfo: cached['基础信息'] || cached['文章信息'] || '' })) return true;
+        if (!isFieldValueValid(f.name, v, f.description, { baseInfo: cached['基础信息'] || cached['文章信息'] || '', referencesText: '' })) return true;
         if (!titlesTrusted && titleNeedsRecheck(f.name, v)) return true;
         return false;
       });
       // 完整命中：所有字段都有效且可信 → 秒出
       if (missing.length === 0) {
         if (opts.write) {
-          const w = await writeFields(table, job, cached, opts.effectiveFields, opts.onlyEmpty, titlesTrusted);
+          const w = await writeFields(table, job, cached, opts.effectiveFields, opts.onlyEmpty, titlesTrusted, '');
           const parts = [`写入 ${w.successCount}/${opts.effectiveFields.length}`];
           if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
           if (w.existingCount) parts.push(`已有跳过 ${w.existingCount}`);
@@ -322,7 +326,7 @@ export default function App() {
         // 缓存与表格已有内容已覆盖本次要提的字段 → 直接写回收尾
         if (opts.write) {
           const preEntry = getCache(key);
-          const w = await writeFields(table, job, partialCached ?? {}, opts.effectiveFields, opts.onlyEmpty, !!preEntry && preEntry.guardVer >= TITLE_GUARD_VER);
+          const w = await writeFields(table, job, partialCached ?? {}, opts.effectiveFields, opts.onlyEmpty, !!preEntry && preEntry.guardVer >= TITLE_GUARD_VER, '');
           setState({ status: 'done', message: `无缺失字段，写入 ${w.successCount}/${opts.effectiveFields.length}`, successCount: w.successCount });
         } else {
           setState({ status: 'done', message: '无缺失字段', successCount: 0 });
@@ -336,11 +340,12 @@ export default function App() {
         const sec = Math.round((Date.now() - startedAt) / 1000);
         setState({ status: 'generating', message: `AI 生成中${segInfo ? `（${segInfo}）` : ''} · 已 ${sec} 秒` });
       }, 3000);
-      let extractResult: { fields: Record<string, string>; raws: string[] };
+      let extractResult: ExtractResult;
       try {
         extractResult = await extractFieldsAuto(text, extractList, { provider: opts.provider, apiKey: opts.apiKey, model: opts.model }, ac.signal, opts.extractMode, (i, n) => { segInfo = `第 ${i}/${n} 段`; });
       } finally { clearInterval(timer); }
       const fields = extractResult.fields;
+      const referencesText = extractResult.referencesText;
       let raws = extractResult.raws;
       // 特殊字段归一化：英文标题没有英文字母（纯中文/中文书名）→ 统一写"无"
       for (const tf of extractList) {
@@ -353,7 +358,7 @@ export default function App() {
         const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === f.name.trim().toLowerCase());
         const v = k ? fields[k] : undefined;
         const s = v == null ? '' : String(v).trim();
-        if (!isFieldValueValid(f.name, v, f.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '' })) return true;
+        if (!isFieldValueValid(f.name, v, f.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' })) return true;
         if (isTitleField(f.name) && s === '无') return true;
         // 高误报字段：批量结果有值也要精读复核（精读带全文+专项规则，可信度更高）
         return isTitleField(f.name) || isKeywordField(f.name) || isAbstractField(f.name) || isRelatedWorkField(f.name);
@@ -362,7 +367,7 @@ export default function App() {
       const retryAll = extractList.filter((f) => needsRetry(f));
       const retryInvalid = retryAll.filter((f) => {
         const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === f.name.trim().toLowerCase());
-        return !isFieldValueValid(f.name, k ? fields[k] : undefined, f.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '' });
+        return !isFieldValueValid(f.name, k ? fields[k] : undefined, f.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' });
       });
       const retryRecheck = retryAll.filter((f) => !retryInvalid.includes(f));
       const retryFields = [...retryInvalid, ...retryRecheck].slice(0, 12);
@@ -372,13 +377,14 @@ export default function App() {
         setState({ status: 'generating', message: `精读重试中（${[invalidMsg, recheckMsg].filter(Boolean).join(' + ')}：${retryFields.map((f) => f.name).join('、')}），耗时与字段数成正比…` });
         try {
           const r2 = await extractFieldsAuto(text, retryFields, { provider: opts.provider, apiKey: opts.apiKey, model: opts.model }, ac.signal, 'single');
+          const retryReferencesText = r2.referencesText || referencesText || '';
           raws = [...raws, ...r2.raws];
           for (const [k, vRaw] of Object.entries(r2.fields)) {
             const rf = retryFields.find((f) => f.name.trim().toLowerCase() === k.trim().toLowerCase());
             if (!rf) continue;
             const s = normalizeSpecialFieldValue(rf.name, (typeof vRaw === 'string' ? vRaw : String(vRaw)).trim());
             const origKey = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === k.trim().toLowerCase());
-            if (isFieldValueValid(rf.name, s, rf.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '' })) {
+            if (isFieldValueValid(rf.name, s, rf.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: retryReferencesText || '' })) {
               // 精读结果有效 → 覆盖批量结果
               if (origKey) fields[origKey] = s; else fields[k] = s;
             } else if (retryInvalid.includes(rf)) {
@@ -403,7 +409,7 @@ export default function App() {
       const titlesTrustedForWrite = !!preWriteEntry && preWriteEntry.guardVer >= TITLE_GUARD_VER;
       setCache(key, mergedFields);
       if (opts.write) {
-        const w = await writeFields(table, job, mergedFields, opts.effectiveFields, opts.onlyEmpty, titlesTrustedForWrite);
+        const w = await writeFields(table, job, mergedFields, opts.effectiveFields, opts.onlyEmpty, titlesTrustedForWrite, referencesText || '');
         const parts = [`${partialCached ? '缓存补提后写入' : '写入'} ${w.successCount}/${opts.effectiveFields.length}`];
         if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
         if (w.echoCount) parts.push(`过滤回声 ${w.echoCount}`);
@@ -452,7 +458,7 @@ export default function App() {
         const entry = getCache(cacheKey(rid, atts[0].token));
         const titlesTrusted = !!entry && entry.guardVer >= TITLE_GUARD_VER;
         const valid = (tf: TargetField, curStr: string): boolean => {
-          if (!isFieldValueValid(tf.name, curStr, tf.description)) return false;
+          if (!isFieldValueValid(tf.name, curStr, tf.description, { referencesText: '' })) return false;
           if (!titlesTrusted && titleNeedsRecheck(tf.name, curStr)) return false;
           return true;
         };

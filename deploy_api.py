@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.15.1 根治摘要/关键词题录污染(looksLikeMetadataDump增自然语句式题录检测:期刊+卷/作者+年份+机构名;新增looksLikeBaseInfoDump跨字段校验摘要与基础信息高度重合即判无效触发重提);isFieldValueValid增extra.baseInfo参数+App全链路6处调用传入基础信息'
+msg = 'deploy: v6.16 相关文献正向校验(extractReferencesBlock+isRelatedWorkValuePlausible逐条命中原文References才放行);彻底阻止AI编造/假链接/拒答话术;修复isTemplateResidue对[1]编号误伤'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 
