@@ -34,7 +34,7 @@ const CACHE_PREFIX = 'litcache:';
 // 配置版本：v6.9（=2）起"仅补提空字段"默认改为不勾选，旧存储只恢复 API 配置、不再恢复旧勾选状态
 const CFG_VER = 2;
 // 面板版本号（显示在标题 + 写入每条记录的完成/失败消息，便于从导出截图追溯实际运行的代码版本）
-const APP_VER = 'v6.15';
+const APP_VER = 'v6.15.1';
 // 缓存结构版本：v6.14（=3）起缓存只存有效值；旧结构缓存（无 cacheVer 或版本更低）整体作废，
 // 根除"历史污染值长年留在缓存里 → 写不进（被校验拦）也清不掉（被 hasNew 误判为有值）"的死锁。
 const CACHE_VER = 3;
@@ -108,7 +108,8 @@ async function writeFields(
       if (!v.trim()) { emptyCount += 1; continue; }
       if (isDescriptionEcho(v, tf.description)) { echoCount += 1; continue; }
       // "无"（英文标题）等合法终值直接写入；真正无效的值（未提及/拒答/模板残留）不写入
-      if (!isFieldValueValid(tf.name, v)) { emptyCount += 1; continue; }
+      // v6.15.1：传入「基础信息」做跨字段校验，摘要若只是题录复述则判无效（不写入，触发重提）
+      if (!isFieldValueValid(tf.name, v, undefined, { baseInfo: fields['基础信息'] || fields['文章信息'] || '' })) { emptyCount += 1; continue; }
       if (onlyEmpty) {
         const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
         const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
@@ -134,7 +135,7 @@ async function writeFields(
       let hasNew = false;
       if (key != null && fields[key] != null) {
         const nv = normalizeSpecialFieldValue(tf.name, String(fields[key])).trim();
-        hasNew = nv !== '' && isFieldValueValid(tf.name, nv);
+        hasNew = nv !== '' && isFieldValueValid(tf.name, nv, undefined, { baseInfo: fields['基础信息'] || fields['文章信息'] || '' });
       }
       if (hasNew) continue; // 本次有有效值已正常写入，无需清理
       const rec = await table.getRecordById(job.recordId);
@@ -272,7 +273,7 @@ export default function App() {
       const missing = opts.effectiveFields.filter((f) => {
         const k = Object.keys(cached).find((ck) => ck.trim().toLowerCase() === f.name.trim().toLowerCase());
         const v = k ? cached[k] : undefined;
-        if (!isFieldValueValid(f.name, v, f.description)) return true;
+        if (!isFieldValueValid(f.name, v, f.description, { baseInfo: cached['基础信息'] || cached['文章信息'] || '' })) return true;
         if (!titlesTrusted && titleNeedsRecheck(f.name, v)) return true;
         return false;
       });
@@ -352,7 +353,7 @@ export default function App() {
         const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === f.name.trim().toLowerCase());
         const v = k ? fields[k] : undefined;
         const s = v == null ? '' : String(v).trim();
-        if (!isFieldValueValid(f.name, v, f.description)) return true;
+        if (!isFieldValueValid(f.name, v, f.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '' })) return true;
         if (isTitleField(f.name) && s === '无') return true;
         // 高误报字段：批量结果有值也要精读复核（精读带全文+专项规则，可信度更高）
         return isTitleField(f.name) || isKeywordField(f.name) || isAbstractField(f.name) || isRelatedWorkField(f.name);
@@ -361,7 +362,7 @@ export default function App() {
       const retryAll = extractList.filter((f) => needsRetry(f));
       const retryInvalid = retryAll.filter((f) => {
         const k = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === f.name.trim().toLowerCase());
-        return !isFieldValueValid(f.name, k ? fields[k] : undefined, f.description);
+        return !isFieldValueValid(f.name, k ? fields[k] : undefined, f.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '' });
       });
       const retryRecheck = retryAll.filter((f) => !retryInvalid.includes(f));
       const retryFields = [...retryInvalid, ...retryRecheck].slice(0, 12);
@@ -377,7 +378,7 @@ export default function App() {
             if (!rf) continue;
             const s = normalizeSpecialFieldValue(rf.name, (typeof vRaw === 'string' ? vRaw : String(vRaw)).trim());
             const origKey = Object.keys(fields).find((ok) => ok.trim().toLowerCase() === k.trim().toLowerCase());
-            if (isFieldValueValid(rf.name, s, rf.description)) {
+            if (isFieldValueValid(rf.name, s, rf.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '' })) {
               // 精读结果有效 → 覆盖批量结果
               if (origKey) fields[origKey] = s; else fields[k] = s;
             } else if (retryInvalid.includes(rf)) {

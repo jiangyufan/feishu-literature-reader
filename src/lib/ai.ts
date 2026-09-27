@@ -167,7 +167,7 @@ export function stripThinkTags(s: string): string {
 }
 
 /** 简单文本归一化（去空白/标点/大小写），用于计算相似度 */
-function normalizeText(s: string): string {
+export function normalizeText(s: string): string {
   return s
     .toLowerCase()
     .replace(/\s+/g, '')
@@ -336,12 +336,46 @@ export function looksLikeMetadataDump(fieldName: string, v: string): boolean {
   if (/issn|isbn|\bdoi\b|10\.\d{4,}\//i.test(s)) return true;
   if (/投稿日期|接收日期|收稿日期|出版日期|版权页|出版社|出版时间|丛\s*书|主编|副主编/.test(s)) return true;
   if (/\b97[89]\d{10}\b/.test(s)) return true; // ISBN-13 裸数字
+  // v6.15.1：自然语句式题录污染（无"标签："结构，但把期刊/卷/作者等题录信息当摘要/关键词填）
+  // 典型如"本文献发表于Automation in Construction期刊，卷175，文章编号106170，2025年，作者为Pablo…"
+  const hasJournal = /期刊|journal|学报|杂志/i.test(s);
+  const hasVol = /卷\s*\d|第\s*\d+\s*卷|文章编号|article\s*(?:number|id)|vol\.?/i.test(s);
+  const hasAuthorMeta = /作者[为是：:]|作者包括|作者分别|作者来自|author/i.test(s);
+  const hasYear = /(19|20)\d{2}\s*年|\b(?:19|20)\d{2}\b/i.test(s);
+  const hasAffil = /大学|学院|系|研究所|university|department|institute|laboratory|理工|天主教|瓦尔帕莱索|加泰罗尼亚|卡斯蒂利亚/i.test(s);
+  if (isAbstractField(fieldName)) {
+    // 摘要堆题录：期刊+卷/文章编号，或 作者+单位/年份（真实摘要不会这么写）
+    if ((hasJournal && (hasVol || hasYear)) || (hasAuthorMeta && (hasAffil || hasYear))) return true;
+  }
+  if (isKeywordField(fieldName)) {
+    // 关键词出现机构/单位名（大学/学院/系等）→ 几乎必是题录误填
+    if (hasAffil) return true;
+  }
+  return false;
+}
+
+/** 摘要是否只是「基础信息」的复述（摘要与基础信息高度重合 → 题录污染，无效，触发重提）。
+ *  用于跨字段校验：真实摘要应概括研究内容，而非把期刊/卷/作者/年份再抄一遍。 */
+export function looksLikeBaseInfoDump(fieldName: string, v: string, baseInfo: string): boolean {
+  if (!isAbstractField(fieldName) || !v || !baseInfo) return false;
+  const a = normalizeText(v);
+  const b = normalizeText(baseInfo);
+  if (!a || !b) return false;
+  // 摘要是基础的超串/子串（摘要只是基础信息加几个字，或反之）→ 复述
+  if (a.includes(b) || b.includes(a)) return true;
+  // 字符集合 Jaccard 相似度过高（摘要几乎全是题录字符）→ 复述
+  const setA = new Set(a);
+  const setB = new Set(b);
+  let inter = 0;
+  for (const c of setA) if (setB.has(c)) inter++;
+  const union = setA.size + setB.size - inter;
+  if (union > 0 && inter / union > 0.55) return true;
   return false;
 }
 
 /** 字段值是否为有效终值（可直接写入表格 / 视为"已提取"）。
  * 注意：「英文标题」的"无"是合法终值（确实没有英文标题），不能再当成空值反复重提。 */
-export function isFieldValueValid(fieldName: string, v: string | null | undefined, description = ''): boolean {
+export function isFieldValueValid(fieldName: string, v: string | null | undefined, description = '', extra?: { baseInfo?: string }): boolean {
   const s = v == null ? '' : (typeof v === 'string' ? v : String(v)).trim();
   if (!s) return false;
   if (isEnglishTitleField(fieldName) && s === '无') return true;
@@ -354,6 +388,8 @@ export function isFieldValueValid(fieldName: string, v: string | null | undefine
   if (isRelatedWorkField(fieldName) && !isRelatedWorkValuePlausible(s)) return false;
   // 摘要/关键词被写成"作者：xxx；单位：xxx"式元数据罗列 → 无效，触发重提
   if (looksLikeMetadataDump(fieldName, s)) return false;
+  // 摘要只是「基础信息」的复述（与基础信息高度重合）→ 无效，触发重提
+  if (extra?.baseInfo && looksLikeBaseInfoDump(fieldName, s, extra.baseInfo)) return false;
   if (description && isDescriptionEcho(s, description)) return false;
   return true;
 }

@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.15 修复记录3崩溃(AI返回数字导致v.trim is not a function·parseFieldsJson强制转字符串+缺失字段检测String()兜底)+剥离模型推理标签<think>…</think>(记录2中文标题泄漏)+writeFields二次剥离;vite emptyOutDir=true根除孤儿资源'
+msg = 'deploy: v6.15.1 根治摘要/关键词题录污染(looksLikeMetadataDump增自然语句式题录检测:期刊+卷/作者+年份+机构名;新增looksLikeBaseInfoDump跨字段校验摘要与基础信息高度重合即判无效触发重提);isFieldValueValid增extra.baseInfo参数+App全链路6处调用传入基础信息'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 
