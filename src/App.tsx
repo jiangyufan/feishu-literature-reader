@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, ExtractResult, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel, stripThinkTags } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, ExtractResult, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel, stripThinkTags, hardRejectGarbage, sanitizeMonographRelatedWork } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -34,10 +34,10 @@ const CACHE_PREFIX = 'litcache:';
 // 配置版本：v6.9（=2）起"仅补提空字段"默认改为不勾选，旧存储只恢复 API 配置、不再恢复旧勾选状态
 const CFG_VER = 2;
 // 面板版本号（显示在标题 + 写入每条记录的完成/失败消息，便于从导出截图追溯实际运行的代码版本）
-const APP_VER = 'v6.16.2';
+const APP_VER = 'v6.16.3';
 // 缓存结构版本：v6.14（=3）起缓存只存有效值；旧结构缓存（无 cacheVer 或版本更低）整体作废，
 // 根除"历史污染值长年留在缓存里 → 写不进（被校验拦）也清不掉（被 hasNew 误判为有值）"的死锁。
-const CACHE_VER = 3;
+const CACHE_VER = 4;
 
 /** 把 js-sdk 字段描述（可能为 {content:[{text}]} 或字符串）提取为纯文本提示词 */
 function descToText(d: any): string {
@@ -115,6 +115,10 @@ async function writeFields(
       // v6.15.1：传入「基础信息」做跨字段校验；v6.16：传入原文 References 做相关文献正向校验
       const extra = { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' };
       if (!isFieldValueValid(tf.name, v, undefined, extra)) { emptyCount += 1; continue; }
+      // v6.16.3：写表前最终兜底清洗，宁缺勿滥
+      v = hardRejectGarbage(tf.name, v);
+      if (isRelatedWorkField(tf.name)) v = sanitizeMonographRelatedWork(v, referencesText);
+      if (!v.trim()) { emptyCount += 1; continue; }
       if (onlyEmpty) {
         const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
         const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
@@ -150,7 +154,9 @@ async function writeFields(
       if (!curStr) continue;
       const cleanExtra = { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' };
       const curLooksGarbage = !isFieldValueValid(tf.name, curStr, tf.description, cleanExtra)
-        || (titleNeedsRecheck(tf.name, curStr) && !titlesTrusted);
+        || (titleNeedsRecheck(tf.name, curStr) && !titlesTrusted)
+        || !hardRejectGarbage(tf.name, curStr)
+        || (isRelatedWorkField(tf.name) && !sanitizeMonographRelatedWork(curStr, referencesText));
       if (!curLooksGarbage) continue; // 旧值合法（如英文标题的"无"、用户手工填的正确值）→ 不动
       await table.setCellValue(tf.fieldId, job.recordId, '');
       clearedCount += 1;

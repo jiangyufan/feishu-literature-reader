@@ -855,3 +855,40 @@ export async function extractFieldsAuto(
 
   return { fields: merged, raws, referencesText };
 }
+
+/**
+ * 写表前最终兜底清洗：某些 AI 返回值虽然躲过了 isFieldValueValid，但仍含明显垃圾特征，
+ * 在写入表格前再暴力清一次，宁缺勿滥。
+ * 返回清洗后的值；若判定为垃圾则返回空字符串。
+ */
+export function hardRejectGarbage(fieldName: string, v: string): string {
+  const s = (v || '').trim();
+  if (!s) return s;
+  // 相关文献：任何含 http 链接 / 拒答话术 / 搜索指引 / "示例"说明 / Wikipedia 的一律清空
+  if (isRelatedWorkField(fieldName)) {
+    const lower = s.toLowerCase();
+    if (/https?:\/\/|www\.|\.com|\.org|\.net|\.gov|\.edu|\.cn/.test(s)) return '';
+    if (looksLikeFabrication(s) || isEmptyValue(s)) return '';
+    if (/示例|仅供参考|不代表真实|你可以使用|你可以按照|建议你访问|建议您|访问以下|请.*搜索|打开.*scholar|搜索框中输入/.test(s)) return '';
+  }
+  // 摘要/关键词：若仍混入版权页元数据（经 looksLikeMetadataDump 漏网）直接清空
+  if (isAbstractField(fieldName) || isKeywordField(fieldName)) {
+    // 含 ISBN-13 / 出版社 / 版权页 / 丛书 / 主编 / 投稿接收发表日期 / DOI 等
+    if (/\b97[89]\d{10}\b/.test(s)) return '';
+    if (/版权页|出版社|出版时间|丛书|主编|副主编|字数|ISBN|DOI|投稿日期|接收日期|收稿日期|出版日期|在线发表/.test(s)) return '';
+  }
+  return s;
+}
+
+/**
+ * 专著（无 References 栏）的相关文献字段允许值：只允许 "未提及"/"无"/空；任何列表/链接/搜索指引都清空。
+ */
+export function sanitizeMonographRelatedWork(v: string, refBlock?: string): string {
+  const s = (v || '').trim();
+  if (!s) return s;
+  if (s === '未提及' || s === '无') return s;
+  // 有 References 区块 → 走普通校验，这里不清空
+  if (refBlock && refBlock.length >= 20) return s;
+  // 无 References 栏的专著：任何看起来像列表/书目/搜索推荐的话都清空
+  return '';
+}
