@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, ExtractResult, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel, stripThinkTags, hardRejectGarbage, sanitizeMonographRelatedWork } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, ExtractResult, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel, stripThinkTags, hardRejectGarbage, sanitizeMonographRelatedWork, sanitizeKeywordValue } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -34,10 +34,10 @@ const CACHE_PREFIX = 'litcache:';
 // 配置版本：v6.9（=2）起"仅补提空字段"默认改为不勾选，旧存储只恢复 API 配置、不再恢复旧勾选状态
 const CFG_VER = 2;
 // 面板版本号（显示在标题 + 写入每条记录的完成/失败消息，便于从导出截图追溯实际运行的代码版本）
-const APP_VER = 'v6.16.5';
+const APP_VER = 'v6.16.6';
 // 缓存结构版本：v6.14（=3）起缓存只存有效值；旧结构缓存（无 cacheVer 或版本更低）整体作废，
 // 根除"历史污染值长年留在缓存里 → 写不进（被校验拦）也清不掉（被 hasNew 误判为有值）"的死锁。
-const CACHE_VER = 6;
+const CACHE_VER = 7;
 
 /** 把 js-sdk 字段描述（可能为 {content:[{text}]} 或字符串）提取为纯文本提示词 */
 function descToText(d: any): string {
@@ -117,6 +117,8 @@ async function writeFields(
       if (!isFieldValueValid(tf.name, v, undefined, extra)) { emptyCount += 1; continue; }
       // v6.16.3：写表前最终兜底清洗，宁缺勿滥
       v = hardRejectGarbage(tf.name, v);
+      // v6.16.6：关键词按分隔符切分后逐条过滤元数据片段
+      if (isKeywordField(tf.name)) v = sanitizeKeywordValue(v);
       if (isRelatedWorkField(tf.name)) v = sanitizeMonographRelatedWork(v, referencesText);
       if (!v.trim()) { emptyCount += 1; continue; }
       if (onlyEmpty) {
@@ -161,6 +163,44 @@ async function writeFields(
       await table.setCellValue(tf.fieldId, job.recordId, '');
       clearedCount += 1;
     } catch { /* 清理失败不影响主流程 */ }
+  }
+  // v6.16.6：同义字段回填——若面板里有"中文题目"字段但值为空，"中文标题"有有效值，则把中文标题复制给中文题目
+  const titleCnField = effectiveFields.find((f) => f.name.trim() === '中文题目');
+  const titleCnAltField = effectiveFields.find((f) => f.name.trim() === '中文标题');
+  if (titleCnField && titleCnAltField) {
+    try {
+      const rec = await table.getRecordById(job.recordId);
+      const cur = rec.fields[titleCnField.fieldId];
+      const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
+      if (!curStr) {
+        const altKey = Object.keys(fields).find((k) => k.trim().toLowerCase() === titleCnAltField.name.trim().toLowerCase());
+        const altV = altKey ? fields[altKey] : undefined;
+        const altS = altV == null ? '' : String(altV).trim();
+        if (altS && isFieldValueValid(titleCnAltField.name, altS, titleCnAltField.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' })) {
+          await table.setCellValue(titleCnField.fieldId, job.recordId, altS);
+          successCount += 1;
+        }
+      }
+    } catch { /* 回填失败不影响主流程 */ }
+  }
+  // v6.16.6：同义字段回填——"研究目的"为空时回填"研究目标"的有效值
+  const goalField = effectiveFields.find((f) => f.name.trim() === '研究目的');
+  const goalAltField = effectiveFields.find((f) => f.name.trim() === '研究目标');
+  if (goalField && goalAltField) {
+    try {
+      const rec = await table.getRecordById(job.recordId);
+      const cur = rec.fields[goalField.fieldId];
+      const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
+      if (!curStr) {
+        const altKey = Object.keys(fields).find((k) => k.trim().toLowerCase() === goalAltField.name.trim().toLowerCase());
+        const altV = altKey ? fields[altKey] : undefined;
+        const altS = altV == null ? '' : String(altV).trim();
+        if (altS && isFieldValueValid(goalAltField.name, altS, goalAltField.description, { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' })) {
+          await table.setCellValue(goalField.fieldId, job.recordId, altS);
+          successCount += 1;
+        }
+      }
+    } catch { /* 回填失败不影响主流程 */ }
   }
   return { successCount, failCount, emptyCount, echoCount, existingCount, failedFields, clearedCount };
 }

@@ -367,6 +367,8 @@ export function isRelatedWorkValuePlausible(v: string, refBlock?: string): boole
   if (s === '未提及' || s === '无') return true;
   // 全文级别拒答/编造/操作指引（比条目级更稳，如 example.com 假链接+"请注意以上为示例"）
   if (looksLikeFabrication(s) || looksLikeWebBibliography(s) || isEmptyValue(s)) return false;
+  // v6.16.6：任何包含 URL/搜索链接形态的相关文献值直接判无效（example.com、zhihu.com、x-mol.com、google.com 搜索等）
+  if (/https?:\/\/|www\.|\.com|\.org|\.net|\.gov|\.edu|\.cn|scholar\.google|zhihu\.com|x-mol\.com|zhangqiaokeyan\.com/i.test(s)) return false;
   const items = splitRelatedWorkItems(s);
   if (items.length < 2) return false;                                  // 单段散文/单条 → 不是文献列表
 
@@ -597,15 +599,15 @@ function buildPrompt(text: string, fields: TargetField[]): { system: string; use
   const titleRule = titleFields.length
     ? `\n- ${titleFields.map((f) => `「${f.name}」`).join('、')}：必须输出文献自身的标题（通常在首页/封面最显眼处、通常字号最大的一行文字）；字段名含"中文"的（如中文题目/中文标题）外文标题必须翻译成通顺的简体中文，字段名含"英文"的必须保留英文原文，其他普通标题字段外文文献也请翻译成通顺的简体中文；严禁输出以下内容充当标题：①引文/出处串（含 "et al."、期刊名+卷(年份)+页码、DOI、ISSN）；②期刊的特刊/专题/栏目（节点）名称——那是期刊这一期的话题名，不是本文的标题（例如论文标题行通常紧挨作者名，出现在特刊名之后）；③书名号里的中文书名（对论文类文献而言）。如果正文里找不到本文标题，填 "无"，不要拿别的东西凑数。`
     : '';
-  // 关键词字段：只允许原文 Keywords 栏里的术语
+    // 关键词字段：只允许原文 Keywords 栏里的术语
   const kwFields = fields.filter((f) => isKeywordField(f.name));
   const kwRule = kwFields.length
-    ? `\n- ${kwFields.map((f) => `「${f.name}」`).join('、')}：只填原文 Keywords（关键词）栏中列出的术语（通常紧跟摘要之后，多条用分号或顿号分隔）；外文关键词翻译成中文；文献自己提出的关键概念可适当补充，但严禁把以下内容当关键词：作者姓名、期刊名、发表年份、数据库名、文献篇数、投稿/出版日期、出版社、ISBN、"Materiology and Variantology" 这类特刊/栏目名（那是期刊话题名不是本文关键词）。若原文没有 Keywords 栏，填 "未提及"。`
+    ? `\n- ${kwFields.map((f) => `「${f.name}」`).join('、')}：只填原文 Keywords（关键词）栏中列出的术语（通常紧跟摘要之后，多条用分号或顿号分隔）；外文关键词翻译成中文；文献自己提出的关键概念可适当补充，但严禁把以下内容当关键词：作者姓名、期刊名、发表年份、数据库名、文献篇数、投稿/出版日期、出版社、ISBN、主编/副主编姓名、丛书名、字数。若原文没有 Keywords 栏，填 "未提及"。`
     : '';
-  // 摘要字段：概括研究内容本身，严禁元数据
+    // 摘要字段：概括研究内容本身，严禁元数据
   const absFields = fields.filter((f) => isAbstractField(f.name) && !looksLikeFabrication(f.name));
   const absRule = absFields.length
-    ? `\n- ${absFields.map((f) => `「${f.name}」`).join('、')}：概括文献的研究内容本身（研究问题、方法、主要发现/结论），80-200 字；严禁把以下元数据写进摘要：作者名、期刊名、卷期年份、投稿/接收/出版日期、出版社、ISBN、数据库名、文献篇数、书名页/版权页信息。摘要内容必须能在【文献全文】中找到依据，不得与${fields.some((f) => f.name.includes('基础信息')) ? '「基础信息」' : '其他书目信息'}重复。`
+    ? `\n- ${absFields.map((f) => `「${f.name}」`).join('、')}：概括文献的研究内容本身（研究问题、方法、主要发现/结论），80-200 字；严禁把以下元数据写进摘要：作者名、期刊名、卷期年份、投稿/接收/出版日期、出版社、ISBN、数据库名、文献篇数、书名页/版权页信息；严禁写成"本书为《XXX》，由XXX著，XXX出版社出版，ISBN为XXX"这种版权页复述句。摘要内容必须能在【文献全文】中找到依据，不得与${fields.some((f) => f.name.includes('基础信息')) ? '「基础信息」' : '其他书目信息'}重复。`
     : '';
   // 相关文献字段：只允许原文 References 里真实存在的条目
   const rwFields = fields.filter((f) => isRelatedWorkField(f.name));
@@ -876,11 +878,12 @@ export function hardRejectGarbage(fieldName: string, v: string): string {
   }
   // 摘要/关键词：若仍混入版权页元数据（经 looksLikeMetadataDump 漏网）直接清空
   if (isAbstractField(fieldName) || isKeywordField(fieldName)) {
-    // 含 ISBN-13 / 出版社 / 版权页 / 丛书 / 主编 / 投稿接收发表日期 / DOI / 书名 等
-    if (/\b97[89]\d{10}\b/.test(s)) return '';
-    if (/版权页|出版社|出版时间|丛书|主编|副主编|字数|ISBN|DOI|书名|出版时间|出版年/.test(s)) return '';
-    // 题录复述句：同时含 "书名"/"本文"/"发表"/"出版" + "作者"/"ISBN"/"出版社" 等两个以上元数据词
-    const biblioMarkers = (s.match(/书名|本文|发表|出版|作者|ISBN|出版社|DOI|卷|期|页码/g) || []).length;
+    // 含 ISBN-13 / 出版社 / 版权页 / 丛书 / 主编 / 投稿接收发表日期 / DOI / 书名 / 字数 等
+    if (/\b97[89]\d{9,12}\b/.test(s)) return '';
+    if (/版权页|出版社|出版时间|丛书|主编|副主编|字数|ISBN|DOI|版权所有|CIP/.test(s)) return '';
+    if (/本书为《[^》]+》，由[^。]+著/.test(s)) return '';
+    // 题录复述句：同时含 "书名"/"本文"/"发表"/"出版" + "作者"/"ISBN"/"出版社" 等三个以上元数据词
+    const biblioMarkers = (s.match(/书名|本书|文献|发表于|刊载于|出版|作者|ISBN|出版社|DOI|卷|期|页码|字数|出版年/g) || []).length;
     if (biblioMarkers >= 3) return '';
   }
   return s;
@@ -895,6 +898,32 @@ export function sanitizeMonographRelatedWork(v: string, refBlock?: string): stri
   if (s === '未提及' || s === '无') return s;
   // 有 References 区块 → 走普通校验，这里不清空
   if (refBlock && refBlock.length >= 20) return s;
-  // 无 References 栏的专著：任何看起来像列表/书目/搜索推荐的话都清空
+  // 无 References 栏的专著：任何看起来像列表/书目/搜索推荐/外链的话都清空
   return '';
+}
+
+/**
+ * 关键词字段清洗：按逗号/顿号/分号切分后逐条过滤，删除含 ISBN/出版社/作者/年份/字数/丛书等元数据的片段。
+ * 只要还剩一条真正的概念词就保留；全部片段都是垃圾则返回空。
+ */
+export function sanitizeKeywordValue(v: string): string {
+  const s = (v || '').trim();
+  if (!s) return s;
+  const seps = /[,，;；、]/;
+  const items = s.split(seps).map((x) => x.trim()).filter(Boolean);
+  if (!items.length) return s;
+  const keep: string[] = [];
+  for (const it of items) {
+    const lower = it.toLowerCase();
+    // 元数据过滤：ISBN、出版社、年份、字数、丛书、主编、作者名、DOI、出版流程词
+    if (/\b97[89]\d{9,12}\b/.test(it)) continue;
+    if (/出版社|出版年|出版时间|ISBN|DOI|版权页|丛书|主编|副主编|字数/.test(it)) continue;
+    if (/^\d{4}\s*年?$|^\d{4}-\d{2}$/.test(it)) continue;
+    // 人名过滤：关键词通常不会是完整作者署名（2-4 个中文常见姓名，或英文名+姓）——这里只过滤明显是"张三 著""Pablo Araya"类作者署名
+    if (/[\u4e00-\u9fa5]{2,4}\s*(?:著|主编|副主编|译)$/.test(it)) continue;
+    if (/^[A-Z][a-z]+\s+[A-Z][a-z]+(-[A-Z][a-z]+)?$/.test(it)) continue;
+    keep.push(it);
+  }
+  if (!keep.length) return '';
+  return keep.join('；');
 }
