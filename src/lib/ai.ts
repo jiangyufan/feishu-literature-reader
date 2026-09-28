@@ -485,6 +485,9 @@ export function looksLikeMetadataDump(fieldName: string, v: string): boolean {
     if ((hasJournal && (hasVol || hasYear)) || (hasAuthorMeta && (hasAffil || hasYear))) return true;
     // "本文为发表于 X 期刊 Y 期" / "本文发表于 X 期刊" / "文章发表于" 等开头陈述 → 题录复述
     if (/^(本文|文章|本研究|该文|该研究)[是为]?\s*(?:发表|出版|刊载|刊于|载于|收录|来自)/i.test(s)) return true;
+    // v6.16.5：摘要里出现书名号《期刊/书名》+ 年份 + 卷/期/文章编号/页码 → 题录复述
+    if (/《[^》]+》\s*\d{4}年?\s*第?\s*\d+\s*[卷期](?:，|,)?\s*(?:文章编号|页码|pp\.)/.test(s)) return true;
+    if (/《[^》]+》\s*\(\d{4}\)\s*[:：]?\s*\d{4,}/.test(s)) return true;
   }
   return false;
 }
@@ -676,7 +679,7 @@ async function callOnce(
       : '';
     // 标题类字段：只输出标题本身，严禁引文/出处串/特刊节点名/版权页串
     const titleRule = isTitleField(f.name) && !isEnglishTitleField(f.name)
-      ? `\n- 特别规则：只输出文献自身的标题本身（通常在首页/封面最显眼处、通常字号最大的独立一行，紧挨作者名之前或之后），外文文献翻译成通顺简体中文；严禁把以下内容当标题：引文/出处串（et al./卷(年份)/DOI/ISSN）、期刊特刊/专题（节点）名称、报告编号、"No. 34 (July 2024)" 刊期号、版权页字符串。若确实找不到本文标题，只填 "无"。`
+      ? `\n- 特别规则：字段名含"中文"（如中文题目/中文标题）时，必须把文献的外文标题翻译成通顺的简体中文填入；字段名不含"中文"的普通标题字段，外文文献也请翻译成通顺简体中文。标题通常在首页/封面最显眼处、字号最大的独立一行，紧挨作者名之前或之后。严禁把以下内容当标题：引文/出处串（et al./卷(年份)/DOI/ISSN）、期刊特刊/专题（节点）名称、报告编号、"No. 34 (July 2024)" 刊期号、版权页字符串。若确实找不到本文标题，只填 "无"。`
       : '';
     // 关键词/摘要/相关文献的精读专项规则
     const kwRule = isKeywordField(f.name)
@@ -869,13 +872,16 @@ export function hardRejectGarbage(fieldName: string, v: string): string {
     const lower = s.toLowerCase();
     if (/https?:\/\/|www\.|\.com|\.org|\.net|\.gov|\.edu|\.cn/.test(s)) return '';
     if (looksLikeFabrication(s) || isEmptyValue(s)) return '';
-    if (/示例|仅供参考|不代表真实|你可以使用|你可以按照|建议你访问|建议您|访问以下|请.*搜索|打开.*scholar|搜索框中输入/.test(s)) return '';
+    if (/示例|仅供参考|不代表真实|你可以使用|你可以按照|建议你访问|建议您|访问以下|请.*搜索|打开.*scholar|搜索框中输入|根据您的要求.*搜索|通过.*搜索.*开源数据库/.test(s)) return '';
   }
   // 摘要/关键词：若仍混入版权页元数据（经 looksLikeMetadataDump 漏网）直接清空
   if (isAbstractField(fieldName) || isKeywordField(fieldName)) {
-    // 含 ISBN-13 / 出版社 / 版权页 / 丛书 / 主编 / 投稿接收发表日期 / DOI 等
+    // 含 ISBN-13 / 出版社 / 版权页 / 丛书 / 主编 / 投稿接收发表日期 / DOI / 书名 等
     if (/\b97[89]\d{10}\b/.test(s)) return '';
-    if (/版权页|出版社|出版时间|丛书|主编|副主编|字数|ISBN|DOI|投稿日期|接收日期|收稿日期|出版日期|在线发表/.test(s)) return '';
+    if (/版权页|出版社|出版时间|丛书|主编|副主编|字数|ISBN|DOI|书名|出版时间|出版年/.test(s)) return '';
+    // 题录复述句：同时含 "书名"/"本文"/"发表"/"出版" + "作者"/"ISBN"/"出版社" 等两个以上元数据词
+    const biblioMarkers = (s.match(/书名|本文|发表|出版|作者|ISBN|出版社|DOI|卷|期|页码/g) || []).length;
+    if (biblioMarkers >= 3) return '';
   }
   return s;
 }
