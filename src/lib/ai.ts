@@ -749,7 +749,7 @@ export async function extractFields(
   signal?: AbortSignal,
   mode: ExtractMode = 'chunk'
 ): Promise<ExtractResult & { usage: any }> {
-  const CHUNK = mode === 'all' ? fields.length : mode === 'single' ? 1 : 7;
+  const CHUNK = mode === 'all' ? fields.length : mode === 'single' ? 1 : 5;
   const deep = mode === 'single';
   const chunks: TargetField[][] = [];
   for (let i = 0; i < fields.length; i += CHUNK) {
@@ -782,8 +782,8 @@ export async function extractFields(
     return false;
   };
 
-  // 并行执行批次（最多 4 个同时进行），大幅缩短总耗时；abort 时立即抛出
-  const CONCURRENCY = 4;
+  // 并行执行批次（single 模式提到 8 并发，与 all 模式总耗时接近但准确率更高）
+  const CONCURRENCY = mode === 'single' ? 8 : 4;
   let next = 0;
   const workers = Array.from({ length: Math.min(CONCURRENCY, chunks.length) }, async () => {
     while (next < chunks.length) {

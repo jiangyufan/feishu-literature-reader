@@ -34,10 +34,10 @@ const CACHE_PREFIX = 'litcache:';
 // 配置版本：v6.9（=2）起"仅补提空字段"默认改为不勾选，旧存储只恢复 API 配置、不再恢复旧勾选状态
 const CFG_VER = 2;
 // 面板版本号（显示在标题 + 写入每条记录的完成/失败消息，便于从导出截图追溯实际运行的代码版本）
-const APP_VER = 'v6.16.3';
+const APP_VER = 'v6.16.4';
 // 缓存结构版本：v6.14（=3）起缓存只存有效值；旧结构缓存（无 cacheVer 或版本更低）整体作废，
 // 根除"历史污染值长年留在缓存里 → 写不进（被校验拦）也清不掉（被 hasNew 误判为有值）"的死锁。
-const CACHE_VER = 4;
+const CACHE_VER = 5;
 
 /** 把 js-sdk 字段描述（可能为 {content:[{text}]} 或字符串）提取为纯文本提示词 */
 function descToText(d: any): string {
@@ -180,8 +180,9 @@ export default function App() {
   const [textQuality, setTextQuality] = useState<TextQuality | null>(null);
   // 最近一次 AI 对每个字段的返回值详情（调试用）
   const [aiReturnPreview, setAiReturnPreview] = useState<string>('');
-  // 提取模式：all=全部一次（实测最快）/ chunk=每批7个 / single=单字段逐个
-  const [extractMode, setExtractMode] = useState<ExtractMode>('all');
+  // 提取模式：all=全部一次（实测最快但字段多易稀释注意力）/ chunk=每批5个 / single=单字段逐个（最准）
+  // v6.16.4 默认 single：字段数≥25 时 all 模式 AI 会顾此失彼，导致标题/摘要/相关文献大面积出错；single 并发 8 总耗时与 all 接近但准确率最高
+  const [extractMode, setExtractMode] = useState<ExtractMode>('single');
   // 解析字数上限：越小单次 AI 调用越快、越省额度；0=智能分段（不限字数，自动切段补漏）
   const [parseLimit, setParseLimit] = useState<number>(150000);
   // 仅补提空字段：默认不勾选（正常提取应为全量提取；需要增量补漏时用户自己勾选）
@@ -647,9 +648,9 @@ export default function App() {
             onChange={(v) => setExtractMode(v as ExtractMode)}
             style={{ width: '100%' }}
             optionList={[
-              { label: '快速模式（全部字段一次提取·最快≈30秒·推荐）', value: 'all' },
-              { label: '分批模式（每批 7 个字段·均衡）', value: 'chunk' },
-              { label: '精读模式（逐字段精读·最准最慢）', value: 'single' },
+              { label: '精读模式（逐字段精读·并发8·最准·推荐）', value: 'single' },
+              { label: '分批模式（每批 5 个字段·均衡）', value: 'chunk' },
+              { label: '快速模式（全部字段一次提取·最快≈30秒·字段多易错）', value: 'all' },
             ]}
           />
         </Form.Slot>
