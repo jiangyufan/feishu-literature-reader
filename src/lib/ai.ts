@@ -576,6 +576,8 @@ export function normalizeSpecialFieldValue(fieldName: string, v: string): string
   if (isEnglishTitleField(fieldName)) {
     const s = (v || '').trim().replace(/^《+|》+$/g, '').trim();
     if (!s) return '无';
+    // v6.19：模型有时返回"无英文标题""没有英文标题"等，统一规范为"无"
+    if (/^(无英文标题|没有英文标题|暂无英文标题|未提供英文标题|不存在英文标题)$/i.test(s)) return '无';
     if (s !== '无' && !/[a-zA-Z]/.test(s)) return '无';
     return s;
   }
@@ -608,6 +610,8 @@ export function looksLikeMetadataDump(fieldName: string, v: string): boolean {
   if (/\b97[89]\d{10}\b/.test(s)) return true; // ISBN-13 裸数字
   // v6.17：期刊名 + 年份/卷期/大学/DOI 这类组合在摘要里 = 题录污染
   if (/artnodes|automation in construction|公共艺术研究丛书/i.test(s)) return true;
+  // v6.19：数据库名（Scopus/Web of Science）混入摘要/关键词
+  if (/\bscopus\b|\bweb\s+of\s+science\b|\bweb\s+of\s+knowledge\b/i.test(s)) return true;
 
   // v6.15.1：自然语句式题录污染（无"标签："结构，但把期刊/卷/作者等题录信息当摘要/关键词填）
   // 典型如"本文献发表于Automation in Construction期刊，卷175，文章编号106170，2025年，作者为Pablo…"
@@ -625,21 +629,23 @@ export function looksLikeMetadataDump(fieldName: string, v: string): boolean {
     // 关键词出现期刊名/卷期/DOI/投稿接收发表日期/文章编号 → 必是题录误填
     if ((hasJournal && (hasVol || hasYear)) || hasDOI || hasDateProcess || /第\s*\d+\s*(?:期|卷)|\bvol\.?\s*\d+|no\.\s*\d+/i.test(s)) return true;
     // v6.17：关键词里出现完整作者姓名（R2: Marcel René Marburger，R3: 孙振华）或书名/丛书名 → 元数据污染
-    if (/marcel\s+rené\s+marburger|marcel\s+rene\s+marburger/i.test(s)) return true;
-    if (/孙振华|上海书画出版社|公共艺术研究丛书|artnodes期刊|universitat\s+oberta\s+de\s+catalunya|dortmund\s+university/i.test(s)) return true;
+    if (/marcel\s+rené\s+marburger|marcel\s+rene\s+marburger|孙振华/i.test(s)) return true;
+    if (/上海书画出版社|公共艺术研究丛书|artnodes期刊|universitat\s+oberta\s+de\s+catalunya|dortmund\s+university|dortmund\s+university\s+of\s+applied\s+science|uoc|加泰罗尼亚开放大学|多特蒙德应用科学与艺术大学/i.test(s)) return true;
+    // v6.19：关键词里出现数据库名/ISSN/丛书/长机构名
+    if (/\bissn\b|\bscopus\b|\bweb\s+of\s+science\b|\bweb\s+of\s+knowledge\b|中国公共艺术|上海书画出版社/i.test(s)) return true;
   }
   if (isAbstractField(fieldName)) {
     // 摘要堆题录：期刊+卷/文章编号，或 作者+单位/年份，或"本文为发表于…"
     if ((hasJournal && (hasVol || hasYear)) || (hasAuthorMeta && (hasAffil || hasYear))) return true;
-    // "本文为发表于 X 期刊 Y 期" / "本文发表于 X 期刊" / "文章发表于" 等开头陈述 → 题录复述
-    if (/^(本文|文章|本研究|该文|该研究)[是为]?\s*(?:发表|出版|刊载|刊于|载于|收录|来自)/i.test(s)) return true;
+    // "本文为发表于 X 期刊 Y 期" / "本文发表于 X 期刊" / "该文献为..." 等开头陈述 → 题录复述
+    if (/^(本文|文章|本研究|该文|该研究|该文献|此文献)[是为]?\s*(?:发表|出版|刊载|刊于|载于|收录|来自)/iu.test(s)) return true;
     // v6.16.5：摘要里出现书名号《期刊/书名》+ 年份 + 卷/期/文章编号/页码 → 题录复述
     if (/《[^》]+》\s*\d{4}年?\s*第?\s*\d+\s*[卷期](?:，|,)?\s*(?:文章编号|页码|pp\.)/.test(s)) return true;
     if (/《[^》]+》\s*\(\d{4}\)\s*[:：]?\s*\d{4,}/.test(s)) return true;
-    // v6.17：摘要开头出现"《书名》是...所著/出版""本书为...""该文发表于..."等版权页/题录句
-    if (/^(《[^》]+》|本书|该文|本文)\s*(?:是|为)\s*[^。]{0,40}(?:所著|出版|发表于|刊载于)/.test(s)) return true;
+    // v6.17：摘要开头出现"《书名》是...所著/出版""本书为...""该文发表于...""X所著的《...》"等版权页/题录句
+    if (/^(?:[\u4e00-\u9fa5A-Za-z\s·.'-]{2,60}所著的)?《[^》]+》\s*(?:是|为)?\s*[^。]{0,40}(?:所著|出版|发表于|刊载于)/i.test(s)) return true;
     // v6.18：更激进的开头题录句清洗
-    if (/^(《[^》]+》|本书|该文|本文|本研究|此文献)\s*(?:的作者是|由\s*[^著]*著|由\s*[^出版]*出版|收录于|发表于|刊载于|出版于|由.*编写)/.test(s)) return true;
+    if (/^(《[^》]+》|本书|该文|本文|本研究|该文献|此文献)\s*(?:的作者是|由\s*[^著]*著|由\s*[^出版]*出版|收录于|发表于|刊载于|出版于|由.*编写)/.test(s)) return true;
   }
   return false;
 }
@@ -1028,12 +1034,12 @@ export function hardRejectGarbage(fieldName: string, v: string): string {
     if (/版权页|出版社|出版时间|丛书|主编|副主编|字数|ISBN|DOI|版权所有|CIP/.test(s)) return '';
     if (/本书为《[^》]+》，由[^。]+著/.test(s)) return '';
     // v6.17：摘要/关键词里出现"《书名》是...所著/出版""该文发表于 X 期刊"等版权页/题录句 → 清空
-    if (/^(《[^》]+》|本书|该文|本文)\s*(?:是|为)\s*[^。]{0,40}(?:所著|出版|发表于|刊载于)/.test(s)) return '';
-    if (/^(本文|文章|本研究|该文|该研究)[是为]?\s*(?:发表|出版|刊载|刊于|载于|收录|来自)/i.test(s)) return '';
+    if (/^(?:[\u4e00-\u9fa5A-Za-z\s·.'-]{2,60}所著的)?《[^》]+》\s*(?:是|为)?\s*[^。]{0,40}(?:所著|出版|发表于|刊载于)/i.test(s)) return '';
+    if (/^(本文|文章|本研究|该文|该研究|该文献|此文献)[是为]?\s*(?:发表|出版|刊载|刊于|载于|收录|来自)/i.test(s)) return '';
     // v6.18：更激进的开头题录句清洗
-    if (/^(《[^》]+》|本书|该文|本文|本研究|此文献)\s*(?:的作者是|由\s*[^著]*著|由\s*[^出版]*出版|收录于|发表于|刊载于|出版于|由.*编写)/.test(s)) return '';
+    if (/^(《[^》]+》|本书|该文|本文|本研究|该文献|此文献)\s*(?:的作者是|由\s*[^著]*著|由\s*[^出版]*出版|收录于|发表于|刊载于|出版于|由.*编写)/.test(s)) return '';
     // 题录复述句：同时含 "书名"/"本书"/"发表"/"出版" + "作者"/"ISBN"/"出版社" 等三个以上元数据词
-    const biblioMarkers = (s.match(/书名|本书|文献|发表于|刊载于|出版|作者|ISBN|出版社|DOI|卷|期|页码|字数|出版年/g) || []).length;
+    const biblioMarkers = (s.match(/书名|本书|文献|发表于|刊载于|出版|作者|ISBN|出版社|DOI|卷|期|页码|字数|出版年|译名|ISSN|SCOPUS|WEB OF SCIENCE/gi) || []).length;
     if (biblioMarkers >= 3) return '';
   }
   // v6.18：期刊字段被污染成"文章说明"/"ISBN"/"出版社"/长段描述时清空
@@ -1083,8 +1089,8 @@ export function sanitizeKeywordValue(v: string): string {
     if (/^[A-Z][a-z]+\s+[A-Z][a-z]+(-[A-Z][a-z]+)?$/.test(it)) continue;
     // v6.17：期刊名、大学/机构名、DOI、投稿日期、文章标题本身（R2 把论文标题当关键词）都过滤
     if (/^(?:artnodes|automation\s+in\s+construction|public\s+art\s+research|公共艺术研究丛书|上海书画出版社)$/i.test(it)) continue;
-    if (/universitat|university|college|institute|department|school\s+of|理工大学|应用科学与艺术大学|多特蒙德|加泰罗尼亚|瓦尔帕莱索|卡斯蒂利亚/i.test(it)) continue;
-    if (/^(?:artistic\s+intelligence\s+vs\.?\s+artificial\s+intelligence)$/i.test(it)) continue;
+    if (/universitat|university|college|institute|department|school\s+of|理工大学|应用科学与艺术大学|多特蒙德|加泰罗尼亚|瓦尔帕莱索|卡斯蒂利亚|uoc|开放大学|issn|scopus|web\s+of\s+science/i.test(it)) continue;
+    if (/^(?:artistic\s+intelligence\s+vs\.?\s+artificial\s+intelligence|艺术智能与人工智能)$/i.test(it)) continue;
     if (/marcel\s+ren[ée]\s+marburger|孙振华/i.test(it)) continue;
     if (/10\.\d{4,}\//i.test(it)) continue;
     keep.push(it);
