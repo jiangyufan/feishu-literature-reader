@@ -48,7 +48,7 @@ for root, dirs, files in os.walk(DIST):
 new_tree = api('POST', '/git/trees', {'tree': blobs})
 
 # 4. 创建 commit
-msg = 'deploy: v6.17 相关文献强制切区/外链商业链接拦截；关键词期刊/大学/作者过滤；摘要题录开头清洗；标题首页锚定扩到3500字；CACHE_VER=8'
+msg = 'deploy: v6.18 相关文献伪造/营销号/拒答拦截强化；References块切区；专著相关文献清空；字段串味清理；去重；CACHE_VER=9'
 new_commit = api('POST', '/git/commits', {
     'message': msg, 'tree': new_tree['sha'], 'parents': [base_commit_sha]})
 

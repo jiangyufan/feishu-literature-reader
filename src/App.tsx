@@ -13,7 +13,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { parsePdf, assessTextQuality, TextQuality } from './lib/pdf';
-import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, ExtractResult, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel, stripThinkTags, hardRejectGarbage, sanitizeMonographRelatedWork, sanitizeKeywordValue } from './lib/ai';
+import { extractFieldsAuto, PROVIDERS, ProviderId, TargetField, ExtractMode, ExtractResult, isDescriptionEcho, isFieldValueValid, isTitleField, isKeywordField, isAbstractField, isRelatedWorkField, isAuthorField, isBaseInfoField, looksLikeFabrication, normalizeSpecialFieldValue, titleNeedsRecheck, TITLE_GUARD_VER, modelLabel, stripThinkTags, hardRejectGarbage, sanitizeMonographRelatedWork, sanitizeKeywordValue, removeRepeatedSegment, isLikelyForeignTitle } from './lib/ai';
 
 type RecState = {
   recordId: string;
@@ -34,10 +34,10 @@ const CACHE_PREFIX = 'litcache:';
 // 配置版本：v6.9（=2）起"仅补提空字段"默认改为不勾选，旧存储只恢复 API 配置、不再恢复旧勾选状态
 const CFG_VER = 2;
 // 面板版本号（显示在标题 + 写入每条记录的完成/失败消息，便于从导出截图追溯实际运行的代码版本）
-const APP_VER = 'v6.17';
+const APP_VER = 'v6.18';
 // 缓存结构版本：v6.14（=3）起缓存只存有效值；旧结构缓存（无 cacheVer 或版本更低）整体作废，
 // 根除"历史污染值长年留在缓存里 → 写不进（被校验拦）也清不掉（被 hasNew 误判为有值）"的死锁。
-const CACHE_VER = 8;
+const CACHE_VER = 9;
 
 /** 把 js-sdk 字段描述（可能为 {content:[{text}]} 或字符串）提取为纯文本提示词 */
 function descToText(d: any): string {
@@ -95,7 +95,8 @@ async function writeFields(
   effectiveFields: TargetField[],
   onlyEmpty: boolean,
   titlesTrusted: boolean,
-  referencesText?: string
+  referencesText?: string,
+  foreignSnippets?: string[]
 ): Promise<{ successCount: number; failCount: number; emptyCount: number; echoCount: number; existingCount: number; failedFields: string[]; clearedCount: number }> {
   let successCount = 0, failCount = 0, emptyCount = 0, echoCount = 0, existingCount = 0, clearedCount = 0;
   const failedFields: string[] = [];
@@ -107,6 +108,8 @@ async function writeFields(
       v = typeof v === 'string' ? v : String(v);
       // 兜底剥离模型推理标签（部分模型在字段值里夹带 <think>…</think>，AI 层已剥过一次，这里再保一道）
       v = stripThinkTags(v);
+      // v6.18：写表前去重复片段（如"标题 标题"）
+      v = removeRepeatedSegment(v);
       // 特殊字段归一化（如英文标题：没有英文字母 → 统一写"无"）
       v = normalizeSpecialFieldValue(tf.name, v);
       if (!v.trim()) { emptyCount += 1; continue; }
@@ -120,6 +123,8 @@ async function writeFields(
       // v6.16.6：关键词按分隔符切分后逐条过滤元数据片段
       if (isKeywordField(tf.name)) v = sanitizeKeywordValue(v);
       if (isRelatedWorkField(tf.name)) v = sanitizeMonographRelatedWork(v, referencesText);
+      // v6.18：命中其他记录标题片段 → 串味垃圾清空（基础信息字段除外）
+      if (v && !isBaseInfoField(tf.name) && isLikelyForeignTitle(v, foreignSnippets || [])) v = '';
       if (!v.trim()) { emptyCount += 1; continue; }
       if (onlyEmpty) {
         const cur = (await table.getRecordById(job.recordId)).fields[tf.fieldId];
@@ -155,10 +160,14 @@ async function writeFields(
       const curStr = (Array.isArray(cur) ? cur.map((s: any) => s?.text ?? s ?? '').join('') : String(cur ?? '')).trim();
       if (!curStr) continue;
       const cleanExtra = { baseInfo: fields['基础信息'] || fields['文章信息'] || '', referencesText: referencesText || '' };
-      const curLooksGarbage = !isFieldValueValid(tf.name, curStr, tf.description, cleanExtra)
+      let curLooksGarbage = !isFieldValueValid(tf.name, curStr, tf.description, cleanExtra)
         || (titleNeedsRecheck(tf.name, curStr) && !titlesTrusted)
         || !hardRejectGarbage(tf.name, curStr)
         || (isRelatedWorkField(tf.name) && !sanitizeMonographRelatedWork(curStr, referencesText));
+      // v6.18：当前值非空且命中其他记录的标题片段 → 视为串味垃圾清空（基础信息字段除外）
+      if (!curLooksGarbage && curStr && !isBaseInfoField(tf.name) && isLikelyForeignTitle(curStr, foreignSnippets || [])) {
+        curLooksGarbage = true;
+      }
       if (!curLooksGarbage) continue; // 旧值合法（如英文标题的"无"、用户手工填的正确值）→ 不动
       await table.setCellValue(tf.fieldId, job.recordId, '');
       clearedCount += 1;
@@ -238,6 +247,7 @@ export default function App() {
   const [recs, setRecs] = useState<RecState[]>([]);
   const abortRef = useRef<AbortController | null>(null);
 
+
   // 初始化：加载表列表与保存的配置
   useEffect(() => {
     Promise.all([bitable.base.getTableMetaList(), bitable.base.getSelection()])
@@ -311,6 +321,7 @@ export default function App() {
       effectiveFields: TargetField[]; extractMode: ExtractMode; parseLimit: number;
       onlyEmpty: boolean; onlyFields?: TargetField[]; provider: ProviderId; apiKey: string; model: string;
       _retried?: boolean; // v6.14：网络错误自动重试标记（防无限重试）
+      foreignSnippets?: string[]; // v6.18：跨记录标题片段，用于识别串味垃圾
     }
   ) => {
     const setState = (patch: Partial<RecState>) =>
@@ -334,7 +345,7 @@ export default function App() {
       // 完整命中：所有字段都有效且可信 → 秒出
       if (missing.length === 0) {
         if (opts.write) {
-          const w = await writeFields(table, job, cached, opts.effectiveFields, opts.onlyEmpty, titlesTrusted, '');
+          const w = await writeFields(table, job, cached, opts.effectiveFields, opts.onlyEmpty, titlesTrusted, '', opts.foreignSnippets);
           const parts = [`写入 ${w.successCount}/${opts.effectiveFields.length}`];
           if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
           if (w.existingCount) parts.push(`已有跳过 ${w.existingCount}`);
@@ -376,7 +387,7 @@ export default function App() {
         // 缓存与表格已有内容已覆盖本次要提的字段 → 直接写回收尾
         if (opts.write) {
           const preEntry = getCache(key);
-          const w = await writeFields(table, job, partialCached ?? {}, opts.effectiveFields, opts.onlyEmpty, !!preEntry && preEntry.guardVer >= TITLE_GUARD_VER, '');
+          const w = await writeFields(table, job, partialCached ?? {}, opts.effectiveFields, opts.onlyEmpty, !!preEntry && preEntry.guardVer >= TITLE_GUARD_VER, '', opts.foreignSnippets);
           setState({ status: 'done', message: `无缺失字段，写入 ${w.successCount}/${opts.effectiveFields.length}`, successCount: w.successCount });
         } else {
           setState({ status: 'done', message: '无缺失字段', successCount: 0 });
@@ -459,7 +470,7 @@ export default function App() {
       const titlesTrustedForWrite = !!preWriteEntry && preWriteEntry.guardVer >= TITLE_GUARD_VER;
       setCache(key, mergedFields);
       if (opts.write) {
-        const w = await writeFields(table, job, mergedFields, opts.effectiveFields, opts.onlyEmpty, titlesTrustedForWrite, referencesText || '');
+        const w = await writeFields(table, job, mergedFields, opts.effectiveFields, opts.onlyEmpty, titlesTrustedForWrite, referencesText || '', opts.foreignSnippets);
         const parts = [`${partialCached ? '缓存补提后写入' : '写入'} ${w.successCount}/${opts.effectiveFields.length}`];
         if (w.emptyCount) parts.push(`AI未给 ${w.emptyCount}`);
         if (w.echoCount) parts.push(`过滤回声 ${w.echoCount}`);
@@ -497,6 +508,19 @@ export default function App() {
     try {
       const table = await bitable.base.getTableById(tableId);
       const recordIds = await table.getRecordIdList();
+      // v6.18：预扫前收集跨记录标题片段，用于识别串味垃圾
+      const foreignSnippets: string[] = [];
+      for (const rid of recordIds) {
+        const rec = await table.getRecordById(rid);
+        const baseInfo = String(((rec.fields as any)['基础信息'] || (rec.fields as any)['文章信息']) ?? '').trim();
+        if (baseInfo) foreignSnippets.push(baseInfo.slice(0, 60));
+        for (const tf of effectiveFields) {
+          if (!isTitleField(tf.name)) continue;
+          const v = (rec.fields as any)[tf.fieldId];
+          const s = (Array.isArray(v) ? v.map((x: any) => x?.text ?? x ?? '').join('') : String(v ?? '')).trim();
+          if (s && s !== '无') foreignSnippets.push(s);
+        }
+      }
       // 预扫：
       // - 勾选“仅补提空字段”→ 逐记录找出空/无效字段，只提取这些（不再整行跳过）
       // - 未勾选（全量重提）→ 旧的整行跳过逻辑（skipThreshold）
@@ -543,7 +567,7 @@ export default function App() {
       for (const job of jobs) {
         if (ac.signal.aborted) break;
         if (job.skipped) continue;
-        await processJob(job, table, ac, { write: true, useCache: true, forceRefresh, effectiveFields, extractMode, parseLimit, onlyEmpty: effOnlyEmpty, onlyFields: job.onlyFields, provider, apiKey, model });
+        await processJob(job, table, ac, { write: true, useCache: true, forceRefresh, effectiveFields, extractMode, parseLimit, onlyEmpty: effOnlyEmpty, onlyFields: job.onlyFields, provider, apiKey, model, foreignSnippets });
       }
     } catch (e: any) {
       Toast.error({ content: `执行出错：${String(e?.message || e)}` });
