@@ -314,20 +314,34 @@ function itemHit(item: string, refBlock: string): boolean {
   // 0. 整句/整条目在 References 里（部分 AI 会原样著录）
   if (ref.includes(items) || items.includes(ref.slice(0, 120))) return true;
   // 1. 提取疑似标题：最长的一段连续非标点文字（通常是论文标题 or 书名）
+  // v6.17：标题匹配长度降到 6 个字符，支持短篇书评/短文标题；中文标题放宽到 4 字
   const titleLike = item.match(/[a-z0-9\u4e00-\u9fa5]{4,}(?:\s+[a-z0-9\u4e00-\u9fa5]+){1,}/gi) || [];
   for (const t of titleLike) {
-    if (t.length >= 8 && ref.includes(t.toLowerCase())) return true;
+    const tl = t.toLowerCase();
+    if (/[\u4e00-\u9fa5]/.test(tl) && tl.length >= 4 && ref.includes(tl)) return true;
+    if (!/[\u4e00-\u9fa5]/.test(tl) && tl.length >= 6 && ref.includes(tl)) return true;
   }
   // 2. 提取第一作者姓氏：开头 "Baumeister," / "N. Catbas," / "Marburger," / "孙振华"
+  // 排除常见虚词和机构名，避免误判
   const author = item.match(/^\s*([A-Z][a-z]+|[\u4e00-\u9fa5]{2,4})/);
   if (author) {
     const family = author[1].toLowerCase();
-    // 姓氏在 References 块中多处出现，更可信
-    if ((ref.match(new RegExp('\\b' + family + '\\b', 'g')) || []).length >= 1) return true;
+    const stopWords = new Set(['the', 'a', 'an', 'on', 'in', 'of', 'for', 'with', 'and', 'art', 'ai', 'pub']);
+    if (!stopWords.has(family)) {
+      if ((ref.match(new RegExp('\\b' + family + '\\b', 'g')) || []).length >= 1) return true;
+    }
   }
   // 3. DOI 匹配
   const doi = item.match(/10\.\d{4,}\/[^\s\])}]+/);
   if (doi && ref.includes(doi[0].toLowerCase())) return true;
+  // 4. 年份 + 期刊/出处关键词组合命中（AI 常省略完整标题但保留年份和期刊名）
+  const year = item.match(/\b(19|20)\d{2}\b/);
+  const journ = item.match(/《([^》]+)》|journal\s+of\s+[^,.]+|proceedings\s+of\s+[^,.]+|transactions\s+on\s+[^,.]+/i);
+  if (year && journ) {
+    const yr = year[1];
+    const jn = (journ[1] || journ[0]).toLowerCase();
+    if (ref.includes(yr) && ref.includes(jn)) return true;
+  }
   return false;
 }
 
@@ -345,10 +359,13 @@ function looksLikeWebBibliography(v: string): boolean {
     'scholar.google', 'webofscience.com', 'web of science', 'scopus.com', 'scopus', 'cnki.net',
     'cnki', 'jstor.org', 'jstor', 'pubmed', 'ieee', 'researchgate', 'springer', 'elsevier',
     'mdpi', 'arxiv.org', 'arxiv', 'ssrn',
+    // v6.17：R2/R3 实测中 AI 编造的搜索推荐/商业页面/机构页
+    'amazon.', 'douban.', 'raco.cat', 'escp.eu', 'medium.', 'fh-dortmund.de/publikationen',
+    'cornell.edu', 'springerprofessional', 'nettricegaskins',
   ];
   if (webMarkers.some((m) => s.includes(m))) return true;
-  // 2. 包含 "(n.d.)" / "(nd)" / "no date" 等无年份占位（真实书目极少这样著录）
-  if (/\(n\.d\.\)|\(nd\)|no date|year unknown|unknown year|年份未提供|未提供年份|无年份|不详/.test(v)) return true;
+  // 2. 包含 "(n.d.)" / "(nd)" / "no date" / "未提供具体发表年份" 等无年份占位（真实书目极少这样著录）
+  if (/\(n\.d\.\)|\(nd\)|no date|year unknown|unknown year|年份未提供|未提供年份|未提供具体发表年份|无年份|不详/.test(v)) return true;
   // 3. 含 "参见" / "可参考" / "更多阅读" / "网上" 等指引词
   if (/参见|可参考|更多阅读|延伸阅读|网上|网站|网址|链接|下载|pdf全文|pdf文档|电子书/.test(v)) return true;
   // 4. 条目格式像 "书名. 网站名. (n.d.)" 这种外部推荐
@@ -367,8 +384,9 @@ export function isRelatedWorkValuePlausible(v: string, refBlock?: string): boole
   if (s === '未提及' || s === '无') return true;
   // 全文级别拒答/编造/操作指引（比条目级更稳，如 example.com 假链接+"请注意以上为示例"）
   if (looksLikeFabrication(s) || looksLikeWebBibliography(s) || isEmptyValue(s)) return false;
-  // v6.16.6：任何包含 URL/搜索链接形态的相关文献值直接判无效（example.com、zhihu.com、x-mol.com、google.com 搜索等）
-  if (/https?:\/\/|www\.|\.com|\.org|\.net|\.gov|\.edu|\.cn|scholar\.google|zhihu\.com|x-mol\.com|zhangqiaokeyan\.com/i.test(s)) return false;
+  // v6.17：任何包含 URL/搜索链接形态的相关文献值直接判无效（example.com、zhihu.com、x-mol.com、google.com 搜索等）
+  // 专著无 References 栏时也会输出 Amazon/豆瓣/ResearchGate 等商业链接，一并拦截
+  if (/https?:\/\/|www\.|\.com|\.org|\.net|\.gov|\.edu|\.cn|scholar\.google|zhihu\.com|x-mol\.com|zhangqiaokeyan\.com|amazon\.|douban\.|researchgate\.|ssrn\.|springer|mdpi|elsevier|arxiv\.org|raco\.cat|escp\.eu|medium\.|cornell\.edu|springerprofessional/i.test(s)) return false;
   const items = splitRelatedWorkItems(s);
   if (items.length < 2) return false;                                  // 单段散文/单条 → 不是文献列表
 
@@ -466,6 +484,9 @@ export function looksLikeMetadataDump(fieldName: string, v: string): boolean {
   if (/issn|isbn|\bdoi\b|10\.\d{4,}\//i.test(s)) return true;
   if (/投稿日期|接收日期|收稿日期|出版日期|版权页|出版社|出版时间|丛\s*书|主编|副主编/.test(s)) return true;
   if (/\b97[89]\d{10}\b/.test(s)) return true; // ISBN-13 裸数字
+  // v6.17：期刊名 + 年份/卷期/大学/DOI 这类组合在摘要里 = 题录污染
+  if (/artnodes|automation in construction|公共艺术研究丛书/i.test(s)) return true;
+
   // v6.15.1：自然语句式题录污染（无"标签："结构，但把期刊/卷/作者等题录信息当摘要/关键词填）
   // 典型如"本文献发表于Automation in Construction期刊，卷175，文章编号106170，2025年，作者为Pablo…"
   const hasJournal = /期刊|journal|学报|杂志/i.test(s);
@@ -481,6 +502,9 @@ export function looksLikeMetadataDump(fieldName: string, v: string): boolean {
     if (hasAffil) return true;
     // 关键词出现期刊名/卷期/DOI/投稿接收发表日期/文章编号 → 必是题录误填
     if ((hasJournal && (hasVol || hasYear)) || hasDOI || hasDateProcess || /第\s*\d+\s*(?:期|卷)|\bvol\.?\s*\d+|no\.\s*\d+/i.test(s)) return true;
+    // v6.17：关键词里出现完整作者姓名（R2: Marcel René Marburger，R3: 孙振华）或书名/丛书名 → 元数据污染
+    if (/marcel\s+rené\s+marburger|marcel\s+rene\s+marburger/i.test(s)) return true;
+    if (/孙振华|上海书画出版社|公共艺术研究丛书|artnodes期刊|universitat\s+oberta\s+de\s+catalunya|dortmund\s+university/i.test(s)) return true;
   }
   if (isAbstractField(fieldName)) {
     // 摘要堆题录：期刊+卷/文章编号，或 作者+单位/年份，或"本文为发表于…"
@@ -490,6 +514,8 @@ export function looksLikeMetadataDump(fieldName: string, v: string): boolean {
     // v6.16.5：摘要里出现书名号《期刊/书名》+ 年份 + 卷/期/文章编号/页码 → 题录复述
     if (/《[^》]+》\s*\d{4}年?\s*第?\s*\d+\s*[卷期](?:，|,)?\s*(?:文章编号|页码|pp\.)/.test(s)) return true;
     if (/《[^》]+》\s*\(\d{4}\)\s*[:：]?\s*\d{4,}/.test(s)) return true;
+    // v6.17：摘要开头出现"《书名》是...所著/出版""本书为...""该文发表于..."等版权页/题录句
+    if (/^(《[^》]+》|本书|该文|本文)\s*(?:是|为)\s*[^。]{0,40}(?:所著|出版|发表于|刊载于)/.test(s)) return true;
   }
   return false;
 }
@@ -612,7 +638,7 @@ function buildPrompt(text: string, fields: TargetField[]): { system: string; use
   // 相关文献字段：只允许原文 References 里真实存在的条目
   const rwFields = fields.filter((f) => isRelatedWorkField(f.name));
   const rwRule = rwFields.length
-    ? `\n- ${rwFields.map((f) => `「${f.name}」`).join('、')}：从文末参考文献（References）列表中挑出最相关的 3-5 条，逐条列出"作者. 标题. 出处. 年份"，格式参考原文献的著录方式（如 GB/T 7714 或文中既有格式）；严禁编造原文参考文献列表中不存在的文献；严禁插入任何互联网搜索行为、操作指引（"打开 Google Scholar"等）或"无法访问互联网"之类的说明——你手上就是全文，文末就有真实参考文献。若确实没有"References"或"参考文献"栏（例如专著/教材的正文并未附带文献列表），只填 "未提及" 一个词；不要列出 Wikipedia、Google Scholar、博客或任何外部网址；不要编造"Public Art 101"、"From Concept to Commission"、"Americans for the Arts" 等通用书名或机构页作为文献。`
+    ? `\n- ${rwFields.map((f) => `「${f.name}」`).join('、')}：只准从文末的 "References" 或 "参考文献" 列表里挑选 3-5 条最相关的条目，逐条一行原样著录（作者. 标题. 出处. 年份），每条独立一行，严禁编造列表中不存在的文献。你手上就是全文，禁止联网搜索、禁止插入任何超链接、禁止用 "Google Scholar" / "Wikipedia" / "ResearchGate" / "Amazon" / "豆瓣" / "博客" 等外部资源凑数；没有 "References" 或 "参考文献" 栏的专著/教材只填 "未提及" 一个词，不要列出任何书目推荐或外部网址。`
     : '';
   return {
     system: `你是一位学术文献阅读助手。下面是一份文献（论文、专著或整本书）经解析得到的全文文本，共 ${text.length} 个字符，可能存在解析噪声。请基于文本内容如实作答，禁止编造文本中没有的信息。你没有联网能力，也不需要联网——所有答案都在文本里。`,
@@ -681,7 +707,7 @@ async function callOnce(
       : '';
     // 标题类字段：只输出标题本身，严禁引文/出处串/特刊节点名/版权页串
     const titleRule = isTitleField(f.name) && !isEnglishTitleField(f.name)
-      ? `\n- 特别规则：字段名含"中文"（如中文题目/中文标题）时，必须把文献的外文标题翻译成通顺的简体中文填入；字段名不含"中文"的普通标题字段，外文文献也请翻译成通顺简体中文。标题通常在首页/封面最显眼处、字号最大的独立一行，紧挨作者名之前或之后。严禁把以下内容当标题：引文/出处串（et al./卷(年份)/DOI/ISSN）、期刊特刊/专题（节点）名称、报告编号、"No. 34 (July 2024)" 刊期号、版权页字符串。若确实找不到本文标题，只填 "无"。`
+      ? `\n- 特别规则：字段名含"中文"（如中文题目/中文标题）时，必须把文献的外文标题翻译成通顺的简体中文填入；字段名不含"中文"的普通标题字段，外文文献也请翻译成通顺简体中文。标题在首页/封面最显眼、字号最大的独立一行，紧挨作者名之前或之后；论文类的标题通常不是期刊名、不是"No. 34 (July 2024)"这种刊期号、不是专题节点名、不是版权页字符串。若确实找不到本文标题，只填 "无"。`
       : '';
     // 关键词/摘要/相关文献的精读专项规则
     const kwRule = isKeywordField(f.name)
@@ -691,13 +717,13 @@ async function callOnce(
       ? `\n- 特别规则：概括研究内容本身（问题/方法/发现），80-200 字；严禁写作者名、期刊/出版社、投稿出版日期、ISBN 等任何元数据。`
       : '';
     const rwRule = isRelatedWorkField(f.name)
-      ? `\n- 特别规则：从文末 References 列表挑最相关的 3-5 条，逐条一行原样著录（作者. 标题. 出处. 年份，每条单独一行）；严禁编造文献、严禁任何搜索指引或拒答话术；无 References 栏时只填 "未提及"，不要列出 Wikipedia、Google Scholar、Web of Science、Scopus、CNKI、JSTOR 或任何外部网址凑数。`
+      ? `\n- 特别规则：只准从文末 "References" / "参考文献" 列表挑 3-5 条，每条单独一行原样著录（作者. 标题. 出处. 年份）；严禁编造、严禁任何搜索指引/拒答话术/超链接；无该列表的专著只填 "未提及"，不要列 Wikipedia、Google Scholar、ResearchGate、Amazon、豆瓣 或任何外部网址。`
       : '';
     // v6.14 首页锚定：标题/作者几乎总在全文最开头，把开头单独再喂一遍，防止模型在长文里"找不到"而填"无"
-    // v6.16.2：作者字段首页锚定范围扩大到 2500 字（部分论文作者信息分散在前言/脚注）
+    // v6.17：标题/作者首页锚定范围统一扩大到 3500 字（长综述/专著封面+版权页+目录可能占较大篇幅）
     let anchorText = '';
     if ((isTitleField(f.name) || isAuthorField(f.name)) && text.length > 3000) {
-      const anchorLen = isAuthorField(f.name) ? 2500 : 1500;
+      const anchorLen = 3500;
       anchorText = `\n\n【全文最开头 ${anchorLen} 字（标题和作者通常就在这里，请优先在这里定位）】\n${text.slice(0, anchorLen)}`;
     }
     user = `请从以下文献全文中，严格按下方要求提取唯一字段「${f.name}」的内容。\n\n【本字段的提取要求】\n${desc}\n\n提取规则：\n- 用简体中文填写（专有名词如作者/期刊/机构名保留原文）；\n- 必须先通读全文、定位与该字段相关的所有信息，再综合给出最准确、最完整的答案；\n- 内容要具体、有信息量，写出关键方法名、数据、对象、结论要点等细节，不要一句话空泛带过；\n- 若文中确实完全没有该字段相关信息，只填 "未提及" 一个词，严禁自己编造"未提供文献全文""文中未找到"等说明性文字；\n- 答案中严禁出现 [xxx]、「……」、「...」等占位符；\n- 直接输出该字段的值（一句话或一段，无需 JSON 包裹、无需重复字段名）。${etRule}${titleRule}${kwRule}${absRule}${rwRule}${anchorText}\n\n【文献全文】\n${text}`;
@@ -872,9 +898,9 @@ export function hardRejectGarbage(fieldName: string, v: string): string {
   // 相关文献：任何含 http 链接 / 拒答话术 / 搜索指引 / "示例"说明 / Wikipedia 的一律清空
   if (isRelatedWorkField(fieldName)) {
     const lower = s.toLowerCase();
-    if (/https?:\/\/|www\.|\.com|\.org|\.net|\.gov|\.edu|\.cn/.test(s)) return '';
+    if (/https?:\/\/|www\.|\.com|\.org|\.net|\.gov|\.edu|\.cn|amazon\.|douban\.|researchgate\.|ssrn\.|raco\.cat|escp\.eu|fh-dortmund\.de|medium\.|springerprofessional/.test(s)) return '';
     if (looksLikeFabrication(s) || isEmptyValue(s)) return '';
-    if (/示例|仅供参考|不代表真实|你可以使用|你可以按照|建议你访问|建议您|访问以下|请.*搜索|打开.*scholar|搜索框中输入|根据您的要求.*搜索|通过.*搜索.*开源数据库/.test(s)) return '';
+    if (/示例|仅供参考|不代表真实|你可以使用|你可以按照|建议你访问|建议您|访问以下|请.*搜索|打开.*scholar|搜索框中输入|根据您的要求.*搜索|通过.*搜索.*开源数据库|链接如下|参考链接|更多.*阅读|延伸阅读/.test(s)) return '';
   }
   // 摘要/关键词：若仍混入版权页元数据（经 looksLikeMetadataDump 漏网）直接清空
   if (isAbstractField(fieldName) || isKeywordField(fieldName)) {
@@ -882,6 +908,9 @@ export function hardRejectGarbage(fieldName: string, v: string): string {
     if (/\b97[89]\d{9,12}\b/.test(s)) return '';
     if (/版权页|出版社|出版时间|丛书|主编|副主编|字数|ISBN|DOI|版权所有|CIP/.test(s)) return '';
     if (/本书为《[^》]+》，由[^。]+著/.test(s)) return '';
+    // v6.17：摘要/关键词里出现"《书名》是...所著/出版""该文发表于 X 期刊"等版权页/题录句 → 清空
+    if (/^(《[^》]+》|本书|该文|本文)\s*(?:是|为)\s*[^。]{0,40}(?:所著|出版|发表于|刊载于)/.test(s)) return '';
+    if (/^(本文|文章|本研究|该文|该研究)[是为]?\s*(?:发表|出版|刊载|刊于|载于|收录|来自)/i.test(s)) return '';
     // 题录复述句：同时含 "书名"/"本文"/"发表"/"出版" + "作者"/"ISBN"/"出版社" 等三个以上元数据词
     const biblioMarkers = (s.match(/书名|本书|文献|发表于|刊载于|出版|作者|ISBN|出版社|DOI|卷|期|页码|字数|出版年/g) || []).length;
     if (biblioMarkers >= 3) return '';
@@ -898,7 +927,11 @@ export function sanitizeMonographRelatedWork(v: string, refBlock?: string): stri
   if (s === '未提及' || s === '无') return s;
   // 有 References 区块 → 走普通校验，这里不清空
   if (refBlock && refBlock.length >= 20) return s;
-  // 无 References 栏的专著：任何看起来像列表/书目/搜索推荐/外链的话都清空
+  // 无 References 栏的专著：任何看起来像列表/书目/搜索推荐/外链/示例说明的话都清空
+  const lower = s.toLowerCase();
+  if (/https?:\/\/|www\.|\.com|\.org|\.net|\.gov|\.edu|\.cn/.test(s)) return '';
+  if (/示例|仅供参考|不代表真实|你可以使用|你可以按照|建议您|访问以下|请.*搜索|打开.*scholar|搜索框中输入|根据您的要求.*搜索|通过.*搜索.*开源数据库|链接如下|参考链接|更多.*阅读|延伸阅读/.test(s)) return '';
+  if (looksLikeFabrication(s) || looksLikeWebBibliography(s) || isEmptyValue(s)) return '';
   return '';
 }
 
@@ -922,6 +955,12 @@ export function sanitizeKeywordValue(v: string): string {
     // 人名过滤：关键词通常不会是完整作者署名（2-4 个中文常见姓名，或英文名+姓）——这里只过滤明显是"张三 著""Pablo Araya"类作者署名
     if (/[\u4e00-\u9fa5]{2,4}\s*(?:著|主编|副主编|译)$/.test(it)) continue;
     if (/^[A-Z][a-z]+\s+[A-Z][a-z]+(-[A-Z][a-z]+)?$/.test(it)) continue;
+    // v6.17：期刊名、大学/机构名、DOI、投稿日期、文章标题本身（R2 把论文标题当关键词）都过滤
+    if (/^(?:artnodes|automation\s+in\s+construction|public\s+art\s+research|公共艺术研究丛书|上海书画出版社)$/i.test(it)) continue;
+    if (/universitat|university|college|institute|department|school\s+of|理工大学|应用科学与艺术大学|多特蒙德|加泰罗尼亚|瓦尔帕莱索|卡斯蒂利亚/i.test(it)) continue;
+    if (/^(?:artistic\s+intelligence\s+vs\.?\s+artificial\s+intelligence)$/i.test(it)) continue;
+    if (/marcel\s+ren[ée]\s+marburger|孙振华/i.test(it)) continue;
+    if (/10\.\d{4,}\//i.test(it)) continue;
     keep.push(it);
   }
   if (!keep.length) return '';
